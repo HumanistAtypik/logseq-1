@@ -8,6 +8,7 @@
             [frontend.fs :as fs]
             [frontend.handler.assets :as assets-handler]
             [frontend.handler.editor :as editor-handler]
+            [frontend.handler.editor.assets :as editor-assets]
             [frontend.handler.notification :as notification]
             [frontend.handler.property :as property-handler]
             [frontend.handler.route :as route-handler]
@@ -16,6 +17,7 @@
             [frontend.util :as util]
             [frontend.util.ref :as ref]
             [logseq.common.config :as common-config]
+            [logseq.common.util :as common-util]
             [logseq.graph-parser.exporter :as gp-exporter]
             [logseq.shui.hooks :as hooks]
             [promesa.core :as p]
@@ -49,7 +51,7 @@
               (assets-handler/normalize-asset-resource-url original-path))
         filename' (if protocol-link?
                     filename
-                    (some-> url (js/decodeURIComponent)
+                    (some-> url (common-util/safe-decode-uri-component)
                             (get-in-repo-assets-full-filename)
                             (string/replace '"/" "_")))
         filekey (gp-exporter/safe-sanitize-file-name
@@ -62,7 +64,9 @@
        :block         block
        :identity      (subs key (- (count key) 15))
        :filename      filename
-       :url           url
+       :url           (or (when (util/electron?)
+                            (assets-handler/file-url->assets-url url))
+                          url)
        :hls-file      (str "assets/" key ".edn")
        :original-path original-path})))
 
@@ -139,7 +143,7 @@
 (defn- db-based-persist-hl-area-image
   [repo png]
   (let [file (js/File. #js [png] "pdf area highlight.png")]
-    (editor-handler/db-based-save-assets! repo [file] {:pdf-area? true})))
+    (editor-assets/db-based-save-assets! repo [file] {:save-only? true})))
 
 (defn- persist-hl-area-image
   [repo-url _repo-dir _current _new-hl _old-hl png]

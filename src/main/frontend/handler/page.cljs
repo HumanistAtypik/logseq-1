@@ -200,20 +200,37 @@
                            [:db/id :block/title :block/name :block/uuid :block/tags]
                            [:block/name (util/page-name-sanity-lc page)]))
 
+(defn- <class-alias-source
+  "If `page` is an alias of a class, return that class. Resolve before
+   convert-to-tag so choosing `#<alias>` never converts the alias page."
+  [repo page]
+  (when (and (:db/id page) (not (entity/class? page)))
+    (p/let [source (db-async/<get-alias-source-page repo (:db/id page))]
+      (when (entity/class? source)
+        source))))
+
 (defn- tag-on-chosen-handler
   [input id pos format current-pos edit-content q]
   (fn [chosen-result ^js e]
     (util/stop e)
     (state/clear-editor-action!)
     (p/let [repo (state/get-current-repo)
+            convert-page-to-tag? (:convert-page-to-tag? chosen-result)
             chosen-result (<chosen-result repo chosen-result)
-            _ (when (and (:convert-page-to-tag? chosen-result)
+            alias-source (<class-alias-source repo chosen-result)
+            class-alias-source? (boolean alias-source)
+            chosen-result (or alias-source chosen-result)
+            convert-page-to-tag? (and convert-page-to-tag? (not class-alias-source?))
+            _ (when (and convert-page-to-tag?
                          (entity/page? chosen-result)
                          (not (entity/class? chosen-result)))
                 (db-page-handler/convert-page-to-tag! chosen-result))
-            target (when (and (:db/id chosen-result) (not (entity/class? chosen-result)))
-                     (db-async/<get-alias-source-page repo (:db/id chosen-result)))
-            chosen-result (if (and target (not (entity/class? chosen-result)) (entity/class? target)) target chosen-result)
+            ;; Re-resolve after conversion so entity/class? reflects the post-conversion snapshot
+            chosen-result (if convert-page-to-tag?
+                            (<chosen-result repo chosen-result)
+                            chosen-result)
+            conversion-rejected? (and convert-page-to-tag?
+                                      (not (entity/class? chosen-result)))
             chosen (:block/title chosen-result)
             class? (or (string/includes? chosen (str (t :editor/new-tag) " "))
                        (entity/class? chosen-result))
@@ -237,16 +254,18 @@
                              q))
             last-pattern (str "#" (when wrapped? page-ref/left-brackets) last-pattern)
             tag-in-page-auto-complete? (= page-ref/right-brackets (common-util/safe-subs edit-content current-pos (+ current-pos 2)))]
-      (p/do!
-       (editor-handler/insert-command! id
-                                       (if (and class? (not inline-tag?)) "" (str "#" wrapped-tag))
-                                       format
-                                       {:last-pattern last-pattern
-                                        :end-pattern (when wrapped? page-ref/right-brackets)
-                                        :command :page-ref})
-       (when-not tag-in-page-auto-complete?
-         (db-page-handler/tag-on-chosen-handler chosen chosen-result class? edit-content current-pos last-pattern))
-       (when input (.focus input))))))
+      (if conversion-rejected?
+        (when input (.focus input))
+        (p/do!
+         (editor-handler/insert-command! id
+                                         (if (and class? (not inline-tag?)) "" (str "#" wrapped-tag))
+                                         format
+                                         {:last-pattern last-pattern
+                                          :end-pattern (when wrapped? page-ref/right-brackets)
+                                          :command :page-ref})
+         (when-not tag-in-page-auto-complete?
+           (db-page-handler/tag-on-chosen-handler chosen chosen-result class? edit-content current-pos last-pattern))
+         (when input (.focus input)))))))
 
 (defn- page-on-chosen-handler
   [id format q]
@@ -315,7 +334,11 @@
            (when (> (count edit-content) current-pos)
              (common-util/safe-subs edit-content pos current-pos)))]
     (if hashtag?
-      (tag-on-chosen-handler input id pos format current-pos edit-content q)
+      (if (editor-handler/org-directive-hashtag-query? q)
+        (fn [_chosen-result e]
+          (util/stop e)
+          (state/clear-editor-action!))
+        (tag-on-chosen-handler input id pos format current-pos edit-content q))
       (page-on-chosen-handler id format q))))
 
 (defn create-today-journal!
@@ -367,9 +390,12 @@
    (let [id (page-util/get-current-page-uuid)]
      (copy-page-url id)))
   ([page-uuid]
-   (if page-uuid
-     (util/copy-to-clipboard!
-      (url-util/get-logseq-web-page-url config/app-website
-                                        (graph-handler/current-graph-id)
-                                        (str page-uuid)))
-     (notification/show! (t :page/no-page-found-to-copy) :warning))))
+   (if-not page-uuid
+     (notification/show! (t :page/no-page-found-to-copy) :warning)
+     (if-let [url (url-util/entity-url-for-copy config/app-website
+                                                (graph-handler/current-graph-id)
+                                                (state/get-current-repo)
+                                                (str page-uuid)
+                                                :page)]
+       (util/copy-to-clipboard! url)
+       (notification/show! (t :page/copy-url-unavailable-warning) :warning)))))

@@ -38,11 +38,12 @@
             [logseq.db.sqlite.util :as sqlite-util]
             [logseq.graph-parser.block :as gp-block]
             [logseq.graph-parser.emoji-data :as emoji-data]
+            [logseq.graph-parser.exporter.finalize :as exporter-finalize]
             [logseq.graph-parser.extract :as extract]
             [logseq.graph-parser.import-profile :as import-profile]
+            [logseq.graph-parser.mldoc :as gp-mldoc]
             [logseq.graph-parser.text :as text]
             [logseq.graph-parser.utf8 :as utf8]
-            [logseq.outliner.pipeline :as outliner-pipeline]
             [promesa.core :as p]))
 
 (defn- add-missing-timestamps
@@ -202,7 +203,8 @@
                                           page-name)
                                         string/trimr))
       (throw (ex-info (str "No uuid found for page name " (pr-str page-name))
-                      (merge ex-data' {:page-name page-name
+                      (merge ex-data' {:reason-code :page-name-not-found
+                                       :page-name page-name
                                        :page-names (sort (keys @page-names-to-uuids))})))))
 
 (defn- replace-namespace-with-parent [block page-names-to-uuids parent-k]
@@ -219,12 +221,42 @@
   [class-name]
   (string/replace class-name "/" "___"))
 
+(defn- user-property-ident?
+  [db-ident]
+  (and (qualified-keyword? db-ident)
+       (db-malli-schema/user-property? db-ident)))
+
+(defn- property-entity-uuid?
+  "True when uuid already belongs to a property. Property and class may share a title."
+  [db block-uuid]
+  (boolean
+   (when block-uuid
+     (when-let [e (d/entity db [:block/uuid block-uuid])]
+       (or (ldb/property? e)
+           (some-> (:db/ident e) user-property-ident?))))))
+
+(defn- find-class-ident
+  "Existing class ident for class-name. Ignores a property ident that may share
+   the same unqualified name when the property page was imported first."
+  [all-idents class-name]
+  (let [ident (keyword class-name)
+        existing (get all-idents ident)
+        lc (string/lower-case class-name)]
+    (or (when (and existing (not (user-property-ident? existing)))
+          existing)
+        (some (fn [[_k v]]
+                (when (and (qualified-keyword? v)
+                           (db-malli-schema/class? v)
+                           (= lc (string/lower-case (name v))))
+                  v))
+              all-idents))))
+
 (defn- find-or-create-class
   ([db class-name all-idents]
    (find-or-create-class db class-name all-idents {}))
   ([db class-name all-idents class-block]
    (let [ident (keyword class-name)]
-     (if-let [db-ident (get @all-idents ident)]
+     (if-let [db-ident (find-class-ident @all-idents class-name)]
        {:db/ident db-ident}
        (let [m
              (if (:block/namespace class-block)
@@ -237,22 +269,28 @@
                (db-class/build-new-class db
                                          (assoc {:block/title class-name
                                                  :block/name (common-util/page-name-sanity-lc class-name)}
-                                                :block/tags (:block/tags class-block))))]
-         (swap! all-idents assoc ident (:db/ident m))
+                                                :block/tags (:block/tags class-block))))
+             ident-key (if (user-property-ident? (get @all-idents ident))
+                         ;; Keep the property mapping; class-name lookup still finds this via find-class-ident
+                         (keyword (str (build-class-ident-name class-name) "#class"))
+                         ident)]
+         (swap! all-idents assoc ident-key (:db/ident m))
          (with-meta m {:new-class? true}))))))
 
-(defn- find-or-gen-class-uuid [page-names-to-uuids page-name db-ident & {:keys [temp-new-class?]}]
-  (or (if temp-new-class?
-        ;; First lookup by possible parent b/c page-names-to-uuids erroneously has the child name
-        ;; and full name. To not guess at the parent name we would need to save all properties-from-classes
-        (or (some #(when (string/ends-with? (key %) (str ns-util/parent-char page-name))
-                     (val %))
-                  @page-names-to-uuids)
-            (get @page-names-to-uuids page-name))
-        (get @page-names-to-uuids page-name))
+(defn- find-or-gen-class-uuid [db page-names-to-uuids page-name db-ident & {:keys [temp-new-class?]}]
+  (let [existing (if temp-new-class?
+                   ;; First lookup by possible parent b/c page-names-to-uuids erroneously has the child name
+                   ;; and full name. To not guess at the parent name we would need to save all properties-from-classes
+                   (or (some #(when (string/ends-with? (key %) (str ns-util/parent-char page-name))
+                                (val %))
+                             @page-names-to-uuids)
+                       (get @page-names-to-uuids page-name))
+                   (get @page-names-to-uuids page-name))]
+    (if (and existing (not (property-entity-uuid? db existing)))
+      existing
       (let [new-uuid (common-uuid/gen-uuid :db-ident-block-uuid db-ident)]
         (swap! page-names-to-uuids assoc page-name new-uuid)
-        new-uuid)))
+        new-uuid))))
 
 (defn- convert-tag? [tag-name {:keys [convert-all-tags? tag-classes]}]
   (and (or convert-all-tags?
@@ -292,7 +330,7 @@
     (let [class-m (find-or-create-class db new-class all-idents)
           class-m' (merge class-m
                           {:block/uuid
-                           (find-or-gen-class-uuid page-names-to-uuids (common-util/page-name-sanity-lc new-class) (:db/ident class-m) {:temp-new-class? true})})]
+                           (find-or-gen-class-uuid db page-names-to-uuids (common-util/page-name-sanity-lc new-class) (:db/ident class-m) {:temp-new-class? true})})]
       (when (:new-class? (meta class-m)) (swap! classes-tx conj class-m'))
       (assert (:block/uuid class-m') "Class must have a :block/uuid")
       [:block/uuid (:block/uuid class-m')])
@@ -307,12 +345,13 @@
           :else
           ;; Creates or updates page within same tx
           (let [class-m (find-or-create-class db (:block/title tag-block) all-idents tag-block)
+                property-uuid? (property-entity-uuid? db (:block/uuid tag-block))
                 class-m' (-> (merge tag-block class-m
-                                    (if internal-tag-conflict?
+                                    (cond
+                                      internal-tag-conflict?
                                       {:block/uuid (common-uuid/gen-uuid :db-ident-block-uuid (:db/ident class-m))}
-                                      (when-not (:block/uuid tag-block)
-                                        (let [id (find-or-gen-class-uuid page-names-to-uuids (:block/name tag-block) (:db/ident class-m))]
-                                          {:block/uuid id}))))
+                                      (or property-uuid? (not (:block/uuid tag-block)))
+                                      {:block/uuid (find-or-gen-class-uuid db page-names-to-uuids (:block/name tag-block) (:db/ident class-m))}))
                              ;; override with imported timestamps
                              (dissoc :block/created-at :block/updated-at)
                              (merge (add-missing-timestamps
@@ -327,19 +366,12 @@
   (and (qualified-keyword? k) (db-class/logseq-class? k)))
 
 (defn- convert-tags-to-classes
-  "Handles converting tags to classes and any post processing of it e.g.
-  cleaning :block/tags when a block is tagged with a namespace page"
+  "Converts tags to classes in input order, keeping only non-nil results."
   [tags db per-file-state user-options all-idents]
-  ;; vec needed is needed so that tags are built in order
-  (let [tags' (vec (keep #(if (logseq-class-ident? %)
-                            %
-                            (convert-tag-to-class db % per-file-state user-options all-idents))
-                         tags))]
-    ;; Only associate leaf child tag with block as other tags are only used to define tag parents.
-    ;; This assumes that extract/extract returns :block/tags with their leaf child first and then its parents
-    (if-let [child-tag (and (some :block/namespace tags) (first tags'))]
-      [child-tag]
-      tags')))
+  (vec (keep #(if (logseq-class-ident? %)
+                %
+                (convert-tag-to-class db % per-file-state user-options all-idents))
+             tags)))
 
 (defn- update-page-tags
   [block db user-options per-file-state all-idents]
@@ -522,6 +554,27 @@
           (dissoc :block/priority)))
     block))
 
+(defn- markdown-heading-level
+  [title]
+  (when (string? title)
+    (when-let [heading (re-find #"^(#{1,6})\s+" (string/triml title))]
+      (count (second heading)))))
+
+(defn- update-block-heading
+  "Strip markdown heading markers from imported titles and store the level as
+   :logseq.property/heading, matching native DB headings."
+  [block]
+  (if (or (contains? #{:code :math :quote} (:logseq.property.node/display-type block))
+          (not (string? (:block/title block))))
+    block
+    (let [title (:block/title block)
+          heading-level (markdown-heading-level title)]
+      (cond-> block
+        (or heading-level (some? (:logseq.property/heading block)))
+        (assoc :block/title (common-util/clear-markdown-heading (string/triml title)))
+        heading-level
+        (assoc :logseq.property/heading heading-level)))))
+
 (defn- get-date-formatter
   [config]
   (or
@@ -694,11 +747,14 @@
   (if (and (qualified-keyword? kw) (db-property/logseq-property? kw))
     kw
     (or (get all-idents kw)
-        (throw (ex-info (str "No ident found for " (pr-str kw)) {})))))
+        (throw (ex-info (str "No ident found for " (pr-str kw))
+                        {:reason-code :unknown-property
+                         :property (if (keyword? kw) (subs (str kw) 1) (str kw))})))))
 
 (defn- get-property-schema [property-schemas kw]
   (or (get property-schemas kw)
-      (throw (ex-info (str "No property schema found for " (pr-str kw)) {}))))
+      (throw (ex-info (str "No property schema found for " (pr-str kw))
+                      (cond-> {} (nil? kw) (assoc :reason-code :unsupported-property))))))
 
 (defn- infer-property-schema-and-get-property-change
   "Infers a property's schema from the given _user_ property value and adds new ones to
@@ -1066,8 +1122,10 @@
                      (when (or preserve-empty-properties?
                                (not (string/blank? val)))
                        [prop
-                       ;; handle float strings b/c graph-parser doesn't
-                        (or (parse-double val) val)])
+                       ;; handle float strings b/c graph-parser doesn't; only when the
+                       ;; number keeps the text (`0000.00000` or `2401.10000` stay text)
+                        (let [n (parse-double val)]
+                          (if (and n (= (str n) (string/trim val))) n val))])
                      [prop val])
                    [prop val])))
          (into {}))))
@@ -1139,7 +1197,7 @@
                                     (let [new-class (first parent-classes-from-properties)
                                           class-m (find-or-create-class db new-class (:all-idents import-state))
                                           class-m' (merge class-m
-                                                          {:block/uuid (find-or-gen-class-uuid page-names-to-uuids (common-util/page-name-sanity-lc new-class) (:db/ident class-m))})]
+                                                          {:block/uuid (find-or-gen-class-uuid db page-names-to-uuids (common-util/page-name-sanity-lc new-class) (:db/ident class-m))})]
                                       (when (> (count parent-classes-from-properties) 1)
                                         (log-fn :skipped-parent-classes "Only one parent class is allowed so skipped ones after the first one" :classes parent-classes-from-properties))
                                       (when (:new-class? (meta class-m)) (swap! classes-tx conj class-m'))
@@ -1159,12 +1217,16 @@
 (defn- migrate-advanced-query-string [query-str]
   (try
     (pretty-print-dissoc query-str [:title :group-by-page? :collapsed?])
-    (catch :default _e
-      ;; rewrite/parse-string can fail on some queries in Advanced Queries in docs graph
-      (js/console.error "Failed to parse advanced query string. Falling back to full query string: " (pr-str query-str))
-      (if-let [query-map (not-empty (common-util/safe-read-map-string query-str))]
-        (pr-str (dissoc query-map :title :group-by-page? :collapsed?))
-        query-str))))
+    (catch :default _
+      ;; Preserve the fallback for queries the rewrite parser cannot read.
+      (try
+        (if-let [query-map (not-empty (common-util/safe-read-map-string query-str))]
+          (pr-str (dissoc query-map :title :group-by-page? :collapsed?))
+          query-str)
+        (catch :default error
+          (throw (ex-info (or (ex-message error) "Could not parse advanced query")
+                          {:reason-code :malformed-query}
+                          error)))))))
 
 (declare extract-block-list ast->text)
 (defn- extract-block-list-item
@@ -1366,6 +1428,27 @@
        x)
      ast-blocks)
     @results))
+
+(defn- maybe-asset-link-text?
+  "Cheap filter before parsing property values for asset links."
+  [s]
+  (and (string? s)
+       (or (string/includes? s "assets/")
+           (string/includes? s "assets\\")
+           (string/includes? (string/lower-case s) ".pdf")
+           (string/includes? s "zotero"))))
+
+(defn- asset-links-from-text
+  [user-config text format]
+  (when (maybe-asset-link-text? text)
+    (:asset-links (walk-ast-blocks user-config
+                                   (gp-mldoc/inline->edn text (gp-mldoc/default-config (or format :markdown)))))))
+
+(defn- property-value-asset-title?
+  [pvalue]
+  (and (map? pvalue)
+       (:logseq.property/created-from-property pvalue)
+       (maybe-asset-link-text? (:block/title pvalue))))
 
 (defn- handle-queries
   "If a block contains a simple or advanced queries, converts block to a #Query node. If a block
@@ -1847,6 +1930,44 @@
           (assoc :asset-blocks-tx asset-blocks)))
       (p/resolved {:block block}))))
 
+(defn- import-user-config
+  [options]
+  (or (:user-config options)
+      (get-in options [:extract-options :user-config])
+      {}))
+
+(defn- options-file-format
+  [options]
+  (if (= "org" (some-> (:file options) path/file-ext)) :org :markdown))
+
+(defn- asset-handle-opts
+  [options]
+  (-> (select-keys options [:log-fn :notify-user :<get-file-stat])
+      (assoc :user-config (import-user-config options)
+             :format (options-file-format options))))
+
+(defn- <handle-assets-in-property-value
+  [pvalue import-state opts]
+  (if-let [asset-links (seq (asset-links-from-text (:user-config opts)
+                                                   (:block/title pvalue)
+                                                   (:format opts)))]
+    (<handle-assets-in-block pvalue {:asset-links (vec asset-links)} import-state opts)
+    (p/resolved {:block pvalue})))
+
+(defn- <handle-assets-in-property-values
+  "Convert asset markdown links in property value entities the same way block
+   bodies are converted, and create the referenced Asset entities."
+  [pvalues-tx import-state opts]
+  (if (some property-value-asset-title? pvalues-tx)
+    (p/let [results (p/all (mapv (fn [pvalue]
+                                   (if (property-value-asset-title? pvalue)
+                                     (<handle-assets-in-property-value pvalue import-state opts)
+                                     (p/resolved {:block pvalue})))
+                                 pvalues-tx))]
+      {:pvalues-tx (mapv :block results)
+       :asset-blocks-tx (into [] (mapcat :asset-blocks-tx) results)})
+    (p/resolved {:pvalues-tx pvalues-tx :asset-blocks-tx []})))
+
 (defn- hls-annotation-md-file?
   [file]
   (string/starts-with? (str (path/basename file)) "hls__"))
@@ -2002,10 +2123,11 @@
              ;; ensure there's no nested $$ pair (i.e. not two separate inline formulas)
              (not (string/includes? (subs title 2 (- (count title) 2)) "$$")))
       (let [math-content (string/trim (subs title 2 (- (count title) 2)))]
-        (merge block
-               {:block/title math-content
-                :logseq.property.node/display-type :math
-                :block/tags [:logseq.class/Math-block]}))
+        ;; the block's other tags (a task's Task, user tags) are kept
+        (-> block
+            (merge {:block/title math-content
+                    :logseq.property.node/display-type :math})
+            (update :block/tags (fnil conj []) :logseq.class/Math-block)))
       block)))
 
 (defn- split-title-by-code-fences
@@ -2062,29 +2184,104 @@
             (assoc :logseq.property.code/lang lang)))
         code-segs))
 
-(defn- handle-embeds
-  "If a block contains page or block embeds, converts block to a :block/link based embed"
-  [block page-names-to-uuids {:keys [embeds]} {:keys [log-fn] :or {log-fn prn}}]
-  (if-let [embed-node (first embeds)]
+(defn- embed-macro-spans
+  "Locate embed macros in UTF-8 source, excluding code blocks and code spans."
+  [title format]
+  (let [encoded (utf8/encode title)
+        config (js/JSON.stringify
+                (clj->js (assoc (gp-mldoc/default-config-map format) :inline_type_with_pos true)))
+        ast (common-util/json->clj (gp-mldoc/parse-json title config))]
+    (into []
+          (mapcat
+           (fn [[[kind] {:keys [start_pos end_pos]}]]
+             (when-not (contains? #{"Src" "Example"} kind)
+               (let [source (utf8/substring encoded start_pos end_pos)
+                     inlines (common-util/json->clj (gp-mldoc/inline-parse-json source config))]
+                 (keep (fn [[node positions]]
+                         (when (and (= "Macro" (first node))
+                                    (= "embed" (:name (second node))))
+                           {:node node
+                            :start (+ start_pos (:start_pos positions))
+                            :end (+ start_pos (:end_pos positions))}))
+                       inlines)))))
+          ast)))
+
+(defn- title-without-embed
+  "Remove embed source spans while leaving task and heading conversion to their handlers."
+  [title marker spans]
+  (let [encoded (utf8/encode title)
+        {:keys [offset fragments]}
+        (reduce (fn [{:keys [offset fragments]} {:keys [start end]}]
+                  (let [fragment-end (if (and (> start offset)
+                                             (= 32 (aget encoded (dec start)))
+                                             (= 32 (aget encoded end)))
+                                       (dec start)
+                                       start)]
+                    {:offset end
+                     :fragments (conj fragments (utf8/substring encoded offset fragment-end))}))
+                {:offset 0 :fragments []}
+                spans)
+        text (string/trim (apply str (conj fragments (utf8/substring encoded offset))))
+        body (string/replace text #"^#+(?:\s+|$)" "")
+        body-without-marker (if (and marker (string/starts-with? body marker))
+                              (string/trim (subs body (count marker)))
+                              body)]
+    (when-not (string/blank? body-without-marker) text)))
+
+(defn- embed-target-uuid
+  [block page-names-to-uuids embed-node log-fn]
+  (let [arg (str (first (:arguments (second embed-node))))]
     (cond
-      (page-ref/page-ref? (str (first (:arguments (second embed-node)))))
-      (let [page-uuid (get-page-uuid page-names-to-uuids
-                                     (some-> (text/get-page-name (first (:arguments (second embed-node))))
-                                             common-util/page-name-sanity-lc)
-                                     {:block block})]
-        (merge block
-               {:block/title ""
-                :block/link [:block/uuid page-uuid]}))
-      (block-ref/block-ref? (str (first (:arguments (second embed-node)))))
-      (let [block-uuid (uuid (block-ref/get-block-ref-id (first (:arguments (second embed-node)))))]
-        (merge block
-               {:block/title ""
-                :block/link [:block/uuid block-uuid]}))
+      (page-ref/page-ref? arg)
+      (let [page-name (text/get-page-name arg)]
+        (if (common-util/uuid-string? page-name)
+          (uuid page-name)
+          (or (try
+                (get-page-uuid page-names-to-uuids
+                               (common-util/page-name-sanity-lc page-name)
+                               {:block block})
+                (catch :default _ nil))
+              (log-fn :missing-embed-page "Ignore embed of a page that is not found" :page-name page-name))))
+
+      (block-ref/block-ref? arg)
+      (uuid (block-ref/get-block-ref-id arg))
+
       :else
-      (do
-        (log-fn :invalid-embed-arguments "Ignore embed because of invalid arguments" :args (:arguments (second embed-node)))
-        block))
+      (log-fn :invalid-embed-arguments "Ignore embed because of invalid arguments"
+              :args (:arguments (second embed-node))))))
+
+(defn- handle-embeds
+  "Convert a single standalone embed to a link; keep other embeds as ordered child blocks."
+  [block page-names-to-uuids {:keys [embeds]} {:keys [log-fn] :or {log-fn prn}}]
+  (if (seq embeds)
+    (let [spans (into []
+                      (keep (fn [{:keys [node] :as span}]
+                              (let [target (embed-target-uuid block page-names-to-uuids node log-fn)]
+                                (when (uuid? target)
+                                  (assoc span :link [:block/uuid target])))))
+                      (embed-macro-spans (:block/title block) (:block/format block)))
+          text (title-without-embed (:block/title block) (:block/marker block) spans)]
+      (cond
+        (empty? spans)
+        block
+
+        (and (nil? text) (= 1 (count spans)))
+        (assoc block :block/title "" :block/link (:link (first spans)))
+
+        :else
+        (assoc block :block/title (or text "") :block.temp/embed-links (mapv :link spans))))
     block))
+
+(defn- build-embed-child-block
+  "The embed of a block that also has text, as its child block"
+  [parent-block link]
+  (sqlite-util/block-with-timestamps
+   {:block/uuid (d/squuid)
+    :block/title ""
+    :block/link link
+    :block/parent [:block/uuid (:block/uuid parent-block)]
+    :block/page (:block/page parent-block)
+    :block/order (db-order/gen-key)}))
 
 (defn- dissoc-nil-block-refs
   [block]
@@ -2122,10 +2319,11 @@
             (cond
               pure-single-code?
               (let [{:keys [text lang]} (first code-segs)]
-                [(cond-> (assoc block'
-                                :block/title text
-                                :block/tags [:logseq.class/Code-block]
-                                :logseq.property.node/display-type :code)
+                [(cond-> (-> block'
+                             (assoc :block/title text
+                                    :logseq.property.node/display-type :code)
+                             ;; the block's other tags (a task's Task, user tags) are kept
+                             (update :block/tags (fnil conj []) :logseq.class/Code-block))
                    lang (assoc :logseq.property.code/lang lang))
                  []])
               has-mixed-content?
@@ -2155,7 +2353,8 @@
    {:keys [import-state journal-created-ats] :as options}
    {:keys [properties-tx]} asset-blocks-tx]
   (let [{:keys [page-names-to-uuids]} per-file-state
-        journal-page-created-at (some-> (:block/page block*) second journal-created-ats)
+        journal-page-created-at (get journal-created-ats
+                                     (get @page-names-to-uuids (second (:block/page block*))))
         prepared-block (cond-> block-after-assets
                          journal-page-created-at
                          (assoc :block/created-at journal-page-created-at))
@@ -2167,13 +2366,21 @@
                    (update-block-tags db (:user-options options) per-file-state (:all-idents import-state))
                    (handle-embeds page-names-to-uuids walked-ast-blocks (select-keys options [:log-fn]))
                    (handle-quotes (select-keys options [:log-fn]))
-                   (handle-math)
                    (update-block-marker db options)
+                   ;; after the task marker is removed: `TODO $$ ... $$` is a math block
+                   (handle-math)
                    (update-block-priority options)
+                   (update-block-heading)
                    (add-missing-timestamps options)
                    (dissoc :block/format :block.temp/ast-blocks))
-        [final-block code-children-tx] (handle-code-blocks block' options)]
-    (concat properties-tx asset-blocks-tx [final-block] code-children-tx)))
+        embed-links (:block.temp/embed-links block')
+        [final-block code-children-tx] (handle-code-blocks (dissoc block' :block.temp/embed-links) options)
+        embed-children (mapv #(build-embed-child-block final-block %) embed-links)]
+    (when (seq embed-children)
+      (swap! (:embed-child-uuids import-state) into (map :block/uuid embed-children)))
+    (concat properties-tx asset-blocks-tx [final-block]
+            embed-children
+            code-children-tx)))
 
 (defn- import-progress!
   [options m]
@@ -2191,19 +2398,28 @@
     (complete-block-tx-data db block* (:block-after-built-in-props core) pre-blocks per-file-state
                             walked-ast-blocks options core nil)))
 
+(defn- <complete-block-tx-with-assets
+  [db block* pre-blocks per-file-state walked-ast-blocks options core]
+  (let [asset-opts (asset-handle-opts options)
+        import-state (:import-state options)]
+    (p/let [{block-after-assets :block :keys [asset-blocks-tx]}
+            (if (seq (:asset-links walked-ast-blocks))
+              (<handle-assets-in-block (:block-after-built-in-props core)
+                                       walked-ast-blocks
+                                       import-state
+                                       asset-opts)
+              (p/resolved {:block (:block-after-built-in-props core)}))
+            {:keys [pvalues-tx] pvalue-asset-tx :asset-blocks-tx}
+            (<handle-assets-in-property-values (:properties-tx core) import-state asset-opts)]
+      (complete-block-tx-data db block* block-after-assets pre-blocks per-file-state
+                              walked-ast-blocks options
+                              (assoc core :properties-tx pvalues-tx)
+                              (concat asset-blocks-tx pvalue-asset-tx)))))
+
 (defn- <build-block-tx
   [db block* pre-blocks per-file-state walked-ast-blocks options]
-  (let [core (build-block-tx-core db block* pre-blocks per-file-state walked-ast-blocks options)]
-    (if (seq (:asset-links walked-ast-blocks))
-      (p/let [{block-after-assets :block :keys [asset-blocks-tx]}
-              (<handle-assets-in-block (:block-after-built-in-props core)
-                                      walked-ast-blocks
-                                      (:import-state options)
-                                      (select-keys options [:log-fn :notify-user :<get-file-stat :user-config]))]
-        (complete-block-tx-data db block* block-after-assets pre-blocks per-file-state
-                                  walked-ast-blocks options core asset-blocks-tx))
-      (p/resolved (complete-block-tx-data db block* (:block-after-built-in-props core) pre-blocks
-                                          per-file-state walked-ast-blocks options core nil)))))
+  (<complete-block-tx-with-assets db block* pre-blocks per-file-state walked-ast-blocks options
+                                  (build-block-tx-core db block* pre-blocks per-file-state walked-ast-blocks options)))
 
 (defn- update-page-alias
   [m page-names-to-uuids]
@@ -2219,8 +2435,8 @@
         (assoc :block/title (:block/name m))
         (seq (:block/alias m))
         (update-page-alias (:page-names-to-uuids per-file-state))
-        (journal-created-ats (:block/name m))
-        (assoc :block/created-at (journal-created-ats (:block/name m))))
+        (journal-created-ats (:block/uuid m))
+        (assoc :block/created-at (journal-created-ats (:block/uuid m))))
       (add-missing-timestamps options)
       (update-page-tags db user-options per-file-state all-idents)
       (dissoc ::file-page?)))
@@ -2288,6 +2504,15 @@
 (defn- block-has-asset-links?
   [walked-by-uuid block]
   (seq (:asset-links (get walked-by-uuid (:block/uuid block)))))
+
+(defn- block-has-property-asset-links?
+  [block]
+  (boolean (some maybe-asset-link-text? (vals (:block/properties-text-values block)))))
+
+(defn- block-needs-async-asset-handling?
+  [walked-by-uuid block]
+  (or (block-has-asset-links? walked-by-uuid block)
+      (block-has-property-asset-links? block)))
 
 (defn- block-uuid-ref?
   [ref]
@@ -2635,6 +2860,7 @@
    :all-existing-page-uuids (atom {})
    ;; Incremental extract-compatible page name -> uuid index. Updated in save-from-tx.
    :page-names-to-uuids (atom {})
+   :source-path-by-page-id (atom {})
    ;; Map of stable journal file names and canonical page names to their standard journal page uuids.
    :journal-page-name-uuids (atom {})
    ;; Map of property or class names (keyword) to db-ident keywords
@@ -2652,7 +2878,9 @@
    ;; Populated as files are imported and used to drop conflicting alias declarations.
    :alias-owners (atom {})
    ;; Block uuids referenced during import; used for targeted missing-ref cleanup.
-   :placeholder-ref-uuids (atom #{})})
+   :placeholder-ref-uuids (atom #{})
+   ;; Generated embed children can be removed when their targets remain unresolved.
+   :embed-child-uuids (atom #{})})
 
 (defn- build-tx-options [{:keys [user-options] :as options}]
   (merge
@@ -2694,15 +2922,19 @@
   "Separates new pages from new properties tx in preparation for properties to
   be transacted separately. Also builds property pages tx and converts existing
   pages that are now properties. Existing classes with the same title stay
-  classes; a distinct property entity is created instead."
-  [pages-tx old-properties existing-pages import-state upstream-properties]
+  classes, as do pages that become classes in this file (new-class-uuids); a
+  distinct property entity is created instead."
+  [pages-tx old-properties existing-pages import-state upstream-properties new-class-uuids]
   (let [new-properties (set/difference (set (keys @(:property-schemas import-state))) (set old-properties))
+        new-class-page-names (set (keep #(when (contains? new-class-uuids (:block/uuid %)) (:block/name %))
+                                        pages-tx))
         class-occupied-property-names
         (into #{}
               (keep (fn [kw-name]
-                      (when-let [existing-uuid (get existing-pages (name kw-name))]
-                        (when (existing-named-page-is-class? import-state existing-uuid)
-                          kw-name))))
+                      (when (or (contains? new-class-page-names (name kw-name))
+                                (when-let [existing-uuid (get existing-pages (name kw-name))]
+                                  (existing-named-page-is-class? import-state existing-uuid)))
+                        kw-name)))
               new-properties)
         page-tx-for-new-property?
         (fn [page]
@@ -2808,7 +3040,9 @@
    Render/editor never call this path."
   [format content]
   (and (contains? #{:markdown :md} format)
-       (not (re-find #"(?im)```|\{\{|#\+BEGIN_|:LOGBOOK:|^\s*(?:(?:[-*+]|\d+\.)\s+)?>|\]\(|^\s*-\s+\S+::" content))))
+       ;; an outline parse drops a block's body: a display math block (`$$`) loses its
+       ;; formula, a thematic break (`---`) its text
+       (not (re-find #"(?im)```|\$\$|\{\{|#\+BEGIN_|:LOGBOOK:|^\s*(?:(?:[-*+]|\d+\.)\s+)?>|\]\(|^\s*-\s+\S+::|^\s*(?:[-*+]\s+)?(?:-{3,}|\*{3,}|_{3,})\s*$" content))))
 
 (defn- extract-pages-and-blocks
   "Main fn which calls graph-parser to convert markdown into data"
@@ -2847,9 +3081,11 @@
                                      (map with-file-timestamps blocks)))))
 
               :else
-              (when-not (re-find #"whiteboards/.*\.edn$" (str file))
-                (swap! (:ignored-files import-state) conj
-                       {:path file :reason :unsupported-file-format})))]
+              (swap! (:ignored-files import-state) conj
+                     {:path file
+                      :reason (if (re-find #"whiteboards/.*\.edn$" (str file))
+                                :whiteboard-not-supported
+                                :unsupported-file-format)}))]
     ;; Annotation markdown pages are saved for later as they are dependant on the asset being annotated
     (if (hls-annotation-md-file? file)
       (do
@@ -2862,7 +3098,7 @@
   [pages]
   (->> pages
        (map #(when-let [journal-day (:block/journal-day %)]
-               [(:block/name %) (date-time-util/journal-day->ms journal-day)]))
+               [(:block/uuid %) (date-time-util/journal-day->ms journal-day)]))
        (into {})))
 
 (defn- clean-extra-invalid-tags
@@ -2916,21 +3152,60 @@
 (defn- track-placeholder-ref-uuids!
   [{:keys [placeholder-ref-uuids] :as _import-state} blocks-tx]
   (when-let [ref-uuids (seq (into #{}
-                                  (comp (mapcat :block/refs)
+                                  (comp (mapcat #(cond-> (vec (:block/refs %))
+                                                  (:block/link %) (conj (:block/link %))))
                                         (filter block-uuid-ref?)
                                         (map second))
                                   blocks-tx))]
     (swap! placeholder-ref-uuids into ref-uuids)))
 
+(defn- imported-pre-block-content?
+  "True when a file-graph pre-block still has non-property body after page
+   properties have been stripped for a DB import."
+  [block]
+  (and (:block/pre-block? block)
+       (not (string/blank? (:block/title block)))))
+
+(defn- dropped-pre-block-uuids
+  "Pre-blocks that only held page properties are omitted from the DB graph.
+   Their children are re-parented to the page via fix-pre-block-references."
+  [blocks]
+  (into #{}
+        (keep (fn [block]
+                (when (and (:block/pre-block? block)
+                           (not (imported-pre-block-content? block)))
+                  (:block/uuid block))))
+        blocks))
+
+(defn- prepare-blocks-for-db-tx
+  "Keep non-property pre-block body as a regular block. Page properties stay on
+   the page and :block/pre-block? is never transacted."
+  [blocks]
+  (keep (fn [block]
+          (cond
+            (not (:block/pre-block? block))
+            (dissoc block :block/pre-block?)
+
+            (imported-pre-block-content? block)
+            (dissoc block
+                    :block/pre-block?
+                    :block/properties
+                    :block/properties-order
+                    :block/properties-text-values
+                    :block/invalid-properties
+                    :block/macros)
+
+            :else
+            nil))
+        blocks))
+
 (defn- <build-blocks-tx
   [conn blocks pre-blocks per-file-state tx-options walked-by-uuid]
-  (let [blocks' (->> blocks
-                     (remove :block/pre-block?)
-                     (map #(dissoc % :block/pre-block?)))]
+  (let [blocks' (prepare-blocks-for-db-tx blocks)]
     (p/loop [tx-data []
              blocks blocks']
       (if-let [block (first blocks)]
-        (if (block-has-asset-links? walked-by-uuid block)
+        (if (block-needs-async-asset-handling? walked-by-uuid block)
           (p/let [block-tx-data (<build-block-tx @conn block pre-blocks per-file-state
                                                  (get walked-by-uuid (:block/uuid block))
                                                  tx-options)]
@@ -2940,6 +3215,39 @@
                                                     tx-options))
                    (rest blocks)))
         tx-data))))
+
+(defn- collect-block-uuid-lookups
+  "Lookup refs [:block/uuid uuid] anywhere in an import tx."
+  [form]
+  (let [ids (volatile! (transient []))]
+    (letfn [(visit [x]
+              (cond
+                (and (vector? x)
+                     (= 2 (count x))
+                     (= :block/uuid (first x))
+                     (uuid? (second x)))
+                (vswap! ids conj! (second x))
+
+                (map? x)
+                (doseq [v (vals x)] (visit v))
+
+                (coll? x)
+                (doseq [v x] (visit v))))]
+      (visit form)
+      (persistent! @ids))))
+
+(defn- prepend-unresolved-block-lookups
+  "Datascript rejects a ref lookup unless that entity is already in the db.
+   Import txs point at journals and blocks that a later file creates, and at
+   entities that appear only later in this tx. A uuid-only map at the front of
+   the tx lets the lookup resolve; the real entity map upserts the same uuid."
+  [db tx]
+  (let [tx (vec tx)
+        missing (->> (collect-block-uuid-lookups tx)
+                     distinct
+                     (remove #(d/entity db [:block/uuid %]))
+                     (mapv (fn [id] {:block/uuid id})))]
+    (into missing tx)))
 
 (defn- build-file-import-blocks-index
   [blocks-tx]
@@ -2972,6 +3280,45 @@
           :current-journal-created-at (journal-file-created-at file)
           :preserve-empty-property-block-uuids preserve-empty-properties-uuids}))
 
+(defn- <build-pages-and-property-assets
+  [conn pages blocks tx-options]
+  (p/let [{:keys [pages-tx page-properties-tx per-file-state existing-pages]}
+          (build-pages-tx conn pages blocks tx-options)
+          {:keys [pvalues-tx asset-blocks-tx]}
+          (<handle-assets-in-property-values page-properties-tx
+                                             (:import-state tx-options)
+                                             (asset-handle-opts tx-options))]
+    {:pages-tx pages-tx
+     :page-properties-tx (concat pvalues-tx asset-blocks-tx)
+     :per-file-state per-file-state
+     :existing-pages existing-pages}))
+
+(defn- index-file-page-sources!
+  [db pages {:keys [page-names-to-uuids]} {:keys [source-path import-state]}]
+  (when source-path
+    (let [page-uuids @page-names-to-uuids]
+      (doseq [{page-name :block/name file-page :block/file} pages
+              :when file-page
+              :let [page-uuid (get page-uuids page-name)
+                    eid (when page-uuid (:db/id (d/entity db [:block/uuid page-uuid])))]
+              :when eid]
+        (swap! (:source-path-by-page-id import-state) assoc eid source-path)))))
+
+(defn- <prepare-file-import
+  [conn file content options log-fn]
+  (p/let [_ (import-progress! options {:phase :parse :file file})
+          parse-start (when log-fn (import-profile/now-ms))
+          {:keys [pages blocks]} (extract-pages-and-blocks @conn file content options)
+          _ (log-phase-ms! log-fn :parse parse-start {:file file})
+          prep-start (when log-fn (import-profile/now-ms))
+          {:keys [blocks preserve-empty-properties-uuids]} (handle-template-blocks blocks)
+          walked-by-uuid (index-walked-ast-blocks (import-user-config options) blocks)
+          tx-options (file-graph-tx-options options pages file preserve-empty-properties-uuids)
+          old-properties (keys @(get-in options [:import-state :property-schemas]))
+          _ (log-phase-ms! log-fn :prep prep-start {:file file})]
+    {:pages pages :blocks blocks :walked-by-uuid walked-by-uuid
+     :tx-options tx-options :old-properties old-properties}))
+
 (defn <add-file-to-db-graph
   "Parse file and save parsed data to the given db graph.
 
@@ -2983,24 +3330,14 @@
                       :as *options}]
   (p/let [file-start (when log-fn (import-profile/now-ms))
           options (assoc *options :notify-user notify-user :log-fn (or log-fn (constantly nil)) :file file)
-          _ (import-progress! options {:phase :parse :file file})
-          parse-start (when log-fn (import-profile/now-ms))
-          {:keys [pages blocks]} (extract-pages-and-blocks @conn file content options)
-          _ (log-phase-ms! log-fn :parse parse-start {:file file})
-          prep-start (when log-fn (import-profile/now-ms))
-          {:keys [blocks preserve-empty-properties-uuids]} (handle-template-blocks blocks)
-          walked-by-uuid (index-walked-ast-blocks (or (:user-config options)
-                                                      (get-in options [:extract-options :user-config])
-                                                      {})
-                                                blocks)
-          tx-options (file-graph-tx-options options pages file preserve-empty-properties-uuids)
-          old-properties (keys @(get-in options [:import-state :property-schemas]))
-          _ (log-phase-ms! log-fn :prep prep-start {:file file})
+          {:keys [pages blocks walked-by-uuid tx-options old-properties]}
+          (<prepare-file-import conn file content options log-fn)
           _ (import-progress! options {:phase :pages-tx :file file})
           pages-start (when log-fn (import-profile/now-ms))
-          {:keys [pages-tx page-properties-tx per-file-state existing-pages]} (build-pages-tx conn pages blocks tx-options)
+          {:keys [pages-tx page-properties-tx per-file-state existing-pages]}
+          (<build-pages-and-property-assets conn pages blocks tx-options)
           _ (log-phase-ms! log-fn :pages-tx pages-start {:file file})
-          pre-blocks (->> blocks (keep #(when (:block/pre-block? %) (:block/uuid %))) set)
+          pre-blocks (dropped-pre-block-uuids blocks)
           _ (import-progress! options {:phase :blocks-tx :file file})
           blocks-start (when log-fn (import-profile/now-ms))
           blocks-tx (<build-blocks-tx conn blocks pre-blocks per-file-state tx-options walked-by-uuid)
@@ -3009,7 +3346,8 @@
           _ (track-placeholder-ref-uuids! (:import-state options) blocks-tx)
           split-start (when log-fn (import-profile/now-ms))
           {:keys [property-pages-tx property-page-properties-tx] pages-tx' :pages-tx}
-          (split-pages-and-properties-tx pages-tx old-properties existing-pages (:import-state options) @(:upstream-properties tx-options))
+          (split-pages-and-properties-tx pages-tx old-properties existing-pages (:import-state options) @(:upstream-properties tx-options)
+                                         (set (keep :block/uuid @(:classes-tx tx-options))))
           _ (log-phase-ms! log-fn :split split-start {:file file})
           tx-meta {::imported-data? true ::path file ::new-graph? true}
           _ (import-progress! options {:phase :property-transact :file file})
@@ -3024,12 +3362,14 @@
           classes-tx' (concat classes-tx retract-page-tags-tx)
           custom-status-tx @(:custom-status-tx tx-options)
           main-tx-start (when log-fn (import-profile/now-ms))
-          tx' (build-file-import-main-tx pages-tx'' page-properties-tx property-page-properties-tx
-                                         classes-tx classes-tx' custom-status-tx blocks-tx)
+          tx' (prepend-unresolved-block-lookups @conn
+               (build-file-import-main-tx pages-tx'' page-properties-tx property-page-properties-tx
+                                          classes-tx classes-tx' custom-status-tx blocks-tx))
           _ (log-phase-ms! log-fn :main-tx main-tx-start {:file file :tx-count (count tx')})
           _ (import-progress! options {:phase :transact :file file})
           transact-start (when log-fn (import-profile/now-ms))
           main-tx-report (ldb/transact! conn tx' tx-meta)
+          _ (index-file-page-sources! @conn pages per-file-state options)
           _ (log-phase-ms! log-fn :transact transact-start {:file file
                                                             :tx-count (count tx')})
           save-start (when log-fn (import-profile/now-ms))
@@ -3037,15 +3377,110 @@
           _ (log-phase-ms! log-fn :save-tx save-start {:file file})
           _ (import-progress! options {:phase :upstream-properties :file file})
           upstream-start (when log-fn (import-profile/now-ms))
+          upstream-properties @(:upstream-properties tx-options)
           upstream-properties-tx
-          (build-upstream-properties-tx @conn @(:upstream-properties tx-options) (:import-state options) log-fn)
-          upstream-tx-report (transact-imported-data! conn upstream-properties-tx tx-meta options)
+          (build-upstream-properties-tx @conn upstream-properties (:import-state options) log-fn)
+          upstream-tx-report
+          (try
+            (transact-imported-data! conn upstream-properties-tx tx-meta options)
+            (catch :default error
+              (let [{:keys [entity-id] kind :error} (ex-data error)]
+                (throw (if (and (= :entity-id/syntax kind) (nil? entity-id)
+                                (some (comp #{:checkbox} :from-type val) upstream-properties))
+                         (ex-info (ex-message error)
+                                  (assoc (ex-data error) :reason-code :invalid-property-value)
+                                  error)
+                         error)))))
           _ (log-phase-ms! log-fn :upstream upstream-start {:file file})
           _ (log-phase-ms! log-fn :file file-start {:file file})]
     [main-tx-report upstream-tx-report]))
 
 ;; Higher level export fns
 ;; =======================
+
+(defn- unwrap-error
+  "nbb/sci rethrows as :sci/error and keeps the original as the cause."
+  [error]
+  (if (and error (= :sci/error (:type (ex-data error))) (ex-cause error))
+    (unwrap-error (ex-cause error))
+    error))
+
+(defn error-str
+  "Readable message from an Error, ExceptionInfo, or other thrown value."
+  [error]
+  (let [error (unwrap-error error)]
+    (or (ex-message error)
+        (when (instance? js/Error error)
+          (.-message error))
+        (when (string? error) error)
+        (try (pr-str error)
+             (catch :default _ "[unprintable error]")))))
+
+(defn file-import-error?
+  [error]
+  (let [error (unwrap-error error)]
+    (or (= :file-graph-import/file-failed (:code (ex-data error)))
+        (true? (gobj/get error "logseqFileImportError")))))
+
+(defn file-import-error
+  "Transit-safe ExceptionInfo attributing an import failure to a graph-relative file."
+  ([path error]
+   (file-import-error path error nil))
+  ([path error {:keys [block line]}]
+   (let [error (unwrap-error error)
+         data (ex-data error)
+         reason (if (file-import-error? error)
+                  (or (:reason data) (error-str error))
+                  (error-str error))
+         reason-code (or (:reason-code data)
+                         (when (= :entity-id/missing (:error data)) :missing-reference))
+         path (or path (:path data) (gobj/get error "logseqImportPath"))
+         block (or block (:block data) (:block/title data))
+         block-title (if (map? block) (:block/title block) block)
+         display-block? (and (string? block-title) (not (string/blank? block-title)))
+         location (cond-> (or path "")
+                    display-block?
+                    (str " (block " (pr-str block-title) ")")
+                    line
+                    (str ":" line))
+         message (if (string/blank? location)
+                   reason
+                   (if (and (string? reason) (string/includes? reason (str path)))
+                     reason
+                     (str location ": " reason)))
+         import-error (ex-info message
+                               (cond-> {:code :file-graph-import/file-failed
+                                        :reason reason}
+                                 (and (string? path) (not (string/blank? path))) (assoc :path path)
+                                 display-block? (assoc :block block-title)
+                                 (some? line) (assoc :line line)
+                                 reason-code (assoc :reason-code reason-code)
+                                 (string? (:property data)) (assoc :property (:property data)))
+                               error)]
+     ;; nbb can drop ex-data across promise boundaries; keep a JS flag too.
+     (gobj/set import-error "logseqFileImportError" true)
+     (when (and (string? path) (not (string/blank? path)))
+       (gobj/set import-error "logseqImportPath" path))
+     import-error)))
+
+(defn- import-file-display-path
+  [file options]
+  (or (when-let [rk (:rpath-key options)]
+        (some-> (get file rk) path/path-normalize))
+      (:path file)))
+
+(defn- finalization-file-error
+  [error import-state]
+  (when-let [source-paths (some-> import-state :source-path-by-page-id deref)]
+    (some (fn [{:keys [entity-map errors]}]
+            (when-let [path (get source-paths (or (:block/page entity-map) (:db/id entity-map)))]
+              (file-import-error path
+                                 (ex-info (error-str error)
+                                          {:block (:block/title entity-map)
+                                           :reason-code (when (some :block/properties errors)
+                                                          :invalid-properties)}
+                                          error))))
+          (:errors (ex-data (unwrap-error error))))))
 
 (defn- export-doc-file
   [{:keys [path idx] :as file} conn <read-file
@@ -3063,7 +3498,11 @@
               _ (set-ui-state [:graph/importing-state :label] :import/loading)
               _ (set-ui-state [:graph/importing-state :current-idx] (inc idx))
               _ (set-ui-state [:graph/importing-state :current-page] path)
-              content (<read-file file)
+              content (-> (p/do! (<read-file file))
+                          (p/catch (fn [error]
+                                     (throw (ex-info (error-str error)
+                                                     {:reason-code :file-unreadable}
+                                                     error)))))
               stat (when (fn? <get-file-stat)
                      (<get-file-stat (or (:fs-path file) path)))
               ;; Prefer birthtime when it is a real time. Fall back to mtime when
@@ -3074,196 +3513,28 @@
                              (common-util/timestamp-ms (or (:birthtime stat) (some-> ^js stat .-birthtime)))
                              modified-at)
               m {:file/path path :file/content content}
-              export-options (cond-> (dissoc options :set-ui-state :<export-file)
+              export-options (cond-> (assoc (dissoc options :set-ui-state :<export-file)
+                                             :source-path (import-file-display-path file options))
                                created-at (assoc :file-created-at created-at)
                                modified-at (assoc :file-updated-at modified-at))
               _ (<export-file conn m export-options)]
         ;; returning val results in smoother ui updates
         m)
       (p/catch (fn [error]
-                 (notify-user {:msg (str "Import failed on " (pr-str path) " with error:\n" (.-message error))
-                               :level :error
-                               :ex-data {:path path :error error}})
-                 (when-let [ignored-files (get-in options [:import-state :ignored-files])]
-                   (swap! ignored-files conj {:path path :reason :export-failed}))
-                 nil))))
+                 (let [display-path (import-file-display-path file options)
+                       import-error (if (file-import-error? error)
+                                      error
+                                      (file-import-error display-path error))]
+                   (notify-user {:msg (ex-message import-error)
+                                 :level :error
+                                 :ex-data (assoc (ex-data import-error) :error error)
+                                 :source-path path})
+                   (when-let [ignored-files (get-in options [:import-state :ignored-files])]
+                     (swap! ignored-files conj {:path display-path :reason :export-failed}))
+                   (if (false? (:fail-fast? options))
+                     nil
+                     (throw import-error)))))))
 
-(defn- remove-block-ref-from-title
-  [title block-uuid]
-  (when (string? title)
-    (-> title
-        (string/replace (block-ref/->block-ref block-uuid) "")
-        (string/replace (page-ref/->page-ref block-uuid) "")
-        (string/replace #" {2,}" " ")
-        string/trim)))
-
-(defn- placeholder-block-ref?
-  [entity]
-  (and (:block/uuid entity)
-       (nil? (:block/title entity))))
-
-(defn- missing-placeholder-ref-datoms
-  [db attr candidate-ref-uuids]
-  (if (seq candidate-ref-uuids)
-    (mapcat (fn [ref-uuid]
-              (when-let [ref-id (some-> (d/entity db [:block/uuid ref-uuid]) :db/id)]
-                (when (placeholder-block-ref? (d/entity db ref-id))
-                  (for [datom (d/datoms db :avet attr ref-id)]
-                    {:source-id (:e datom)
-                     :ref-id ref-id
-                     :ref-uuid ref-uuid}))))
-            candidate-ref-uuids)
-    (->> (d/datoms db :aevt attr)
-         (keep (fn [datom]
-                 (let [ref-entity (d/entity db (:v datom))]
-                   (when (placeholder-block-ref? ref-entity)
-                     {:source-id (:e datom)
-                      :ref-id (:v datom)
-                      :ref-uuid (:block/uuid ref-entity)})))))))
-
-(defn- cleanup-missing-block-refs-tx
-  ([db] (cleanup-missing-block-refs-tx db nil))
-  ([db candidate-ref-uuids]
-   (let [missing-ref-datoms (missing-placeholder-ref-datoms db :block/refs candidate-ref-uuids)
-         missing-link-datoms (missing-placeholder-ref-datoms db :block/link candidate-ref-uuids)
-         refs-by-source-id (group-by :source-id missing-ref-datoms)
-         retract-ref-tx
-         (mapcat (fn [[source-id refs]]
-                   (map (fn [{:keys [ref-id]}]
-                          [:db/retract source-id :block/refs ref-id])
-                        refs))
-                 refs-by-source-id)
-         retract-link-tx
-         (map (fn [{:keys [source-id ref-id]}]
-                [:db/retract source-id :block/link ref-id])
-              missing-link-datoms)
-         update-title-tx
-         (keep (fn [[source-id refs]]
-                 (let [source (d/entity db source-id)
-                       title (:block/title source)
-                       title' (reduce remove-block-ref-from-title title (map :ref-uuid refs))]
-                   (when (and (string? title') (not= title title'))
-                     [:db/add source-id :block/title title'])))
-               refs-by-source-id)
-         retract-placeholder-tx
-         (->> (concat missing-ref-datoms missing-link-datoms)
-              (map (juxt :ref-id :ref-uuid))
-              distinct
-              (map (fn [[ref-id ref-uuid]]
-                     [:db/retract ref-id :block/uuid ref-uuid])))]
-     (concat retract-ref-tx retract-link-tx update-title-tx retract-placeholder-tx))))
-
-(defn- set-finishing-import-ui!
-  [set-ui-state]
-  (set-ui-state [:graph/importing-state :step] :finishing)
-  (set-ui-state [:graph/importing-state :label] :import/finishing)
-  (set-ui-state [:graph/importing-state :current-page] nil))
-
-(defn finalize-imported-graph!
-  "Stamp :block/tx-id and rebuild :block/refs once after file import.
-
-  Per-file import txs set ::new-graph?, so CLI listeners and worker
-  transact-pipeline skip refs. This pass writes both in one transact.
-  File-graph import does not notify renderer clients; ::imported-data?
-  skips worker render-delta broadcast. :transact-new-graph-refs? skips
-  the worker pipeline so refs are not rebuilt a second time."
-  [conn]
-  (let [db @conn
-        entity-ids (d/q '[:find [?e ...]
-                          :where
-                          [?e :block/uuid]
-                          [?e :block/title]
-                          [(missing? $ ?e :block/tx-id)]]
-                     db)]
-    (when (seq entity-ids)
-      (let [tx-id (inc (:max-tx db))
-            rebuild-refs (outliner-pipeline/db-rebuild-block-refs-fn db)
-            tx (into []
-                     (mapcat
-                      (fn [id]
-                        (let [block (d/entity db id)
-                              refs (when-not (:logseq.property.reaction/target block)
-                                     (set (rebuild-refs block)))
-                              old-refs (when (seq refs)
-                                         (into #{} (map :v) (d/datoms db :eavt id :block/refs)))]
-                          (concat [[:db/add id :block/tx-id tx-id]]
-                                  (map (fn [ref] [:db/retract id :block/refs ref])
-                                    (set/difference old-refs refs))
-                                  (map (fn [ref] [:db/add id :block/refs ref])
-                                    (set/difference refs old-refs))))))
-                     entity-ids)]
-        (ldb/transact! conn tx
-          {::imported-data? true ::new-graph? true :transact-new-graph-refs? true})))))
-
-(defn- cleanup-missing-block-refs!
-  ([conn] (cleanup-missing-block-refs! conn nil))
-  ([conn import-state]
-   (let [candidate-ref-uuids (when import-state @(:placeholder-ref-uuids import-state))
-         tx (cleanup-missing-block-refs-tx @conn candidate-ref-uuids)]
-     (when (seq tx)
-       (ldb/transact! conn tx {::imported-data? true})))))
-
-(defn- journal-uuid-normalizations
-  [db]
-  (keep (fn [datom]
-          (let [entity (d/entity db (:e datom))
-                old-uuid (:block/uuid entity)
-                journal-day (:block/journal-day entity)
-                standard-uuid (common-uuid/gen-uuid :journal-page-uuid journal-day)]
-            (when (and old-uuid (not= old-uuid standard-uuid))
-              (when-let [target (d/entity db [:block/uuid standard-uuid])]
-                (when (not= (:db/id target) (:db/id entity))
-                  (throw (ex-info "Cannot normalize journal uuid because the standard uuid is already used"
-                                  {:journal-day journal-day
-                                   :old-uuid old-uuid
-                                   :standard-uuid standard-uuid
-                                   :target-id (:db/id target)}))))
-              {:eid (:db/id entity)
-               :old-uuid old-uuid
-               :standard-uuid standard-uuid})))
-        (d/datoms db :avet :block/journal-day)))
-
-(defn- replace-journal-uuid-refs
-  [value uuid-replacements]
-  (if (seq uuid-replacements)
-    (walk/postwalk
-     (fn [x]
-       (if (string? x)
-         (reduce (fn [s [old-uuid standard-uuid]]
-                   (-> s
-                       (string/replace (page-ref/->page-ref old-uuid)
-                                       (page-ref/->page-ref standard-uuid))
-                       (string/replace (block-ref/->block-ref old-uuid)
-                                       (block-ref/->block-ref standard-uuid))))
-                 x
-                 uuid-replacements)
-         x))
-     value)
-    value))
-
-(defn- normalize-journal-uuids-tx
-  [db]
-  (let [normalizations (vec (journal-uuid-normalizations db))
-        uuid-replacements (map (juxt :old-uuid :standard-uuid) normalizations)
-        uuid-tx (mapcat (fn [{:keys [eid old-uuid standard-uuid]}]
-                          [[:db/retract eid :block/uuid old-uuid]
-                           [:db/add eid :block/uuid standard-uuid]])
-                        normalizations)
-        text-tx (when (seq uuid-replacements)
-                  (keep (fn [datom]
-                          (let [value (:v datom)
-                                value' (when (or (string? value) (coll? value))
-                                         (replace-journal-uuid-refs value uuid-replacements))]
-                            (when (and (some? value') (not= value value'))
-                              [:db/add (:e datom) (:a datom) value'])))
-                        (d/datoms db :eavt)))]
-    (vec (concat uuid-tx text-tx))))
-
-(defn- normalize-journal-uuids!
-  [conn]
-  (let [tx (normalize-journal-uuids-tx @conn)]
-    (when (seq tx)
-      (ldb/transact! conn tx {::imported-data? true}))))
 
 (defn export-doc-files
   "Exports all user created files i.e. under journals/ and pages/.
@@ -3297,25 +3568,31 @@
            (p/doseq [file other-files]
              (export-doc-file file conn <read-file options)))
         (p/then (fn [_]
-                  (p/let [_ (set-finishing-import-ui! set-ui-state)
+                  (p/let [_ (exporter-finalize/set-finishing-import-ui! set-ui-state)
                           _ (import-progress! options {:phase :normalize-journal-uuids})
-                          normalize-tx-report (normalize-journal-uuids! conn)
+                          normalize-tx-report (exporter-finalize/normalize-journal-uuids! conn)
                           _ (when normalize-tx-report (on-tx-report normalize-tx-report))
                           _ (import-progress! options {:phase :cleanup-missing-block-refs})
-                          cleanup-tx-report (cleanup-missing-block-refs! conn (:import-state options))
+                          cleanup-tx-report (exporter-finalize/cleanup-missing-block-refs! conn (:import-state options))
                           _ (when cleanup-tx-report (on-tx-report cleanup-tx-report))
+                          page-order-tx-report (exporter-finalize/ensure-imported-page-parent-orders! conn)
+                          _ (when page-order-tx-report (on-tx-report page-order-tx-report))
                           _ (when (not (false? (:finalize-imported-graph? options)))
                               (import-progress! options {:phase :finalize-imported-graph})
                               (let [finalize-start (when (:log-fn options) (import-profile/now-ms))]
-                                (finalize-imported-graph! conn)
+                                (exporter-finalize/finalize-imported-graph! conn)
                                 (log-phase-ms! (:log-fn options) :finalize-imported-graph finalize-start
                                                {:entities :post-doc-files})))]
                     cleanup-tx-report)))
         (p/catch (fn [e]
-                   (notify-user {:msg (str "Import has unexpected error:\n" (.-message e))
-                                 :level :error
-                                 :ex-data {:error e}})
-                   (throw e)))))))
+                   (when-not (file-import-error? e)
+                     (notify-user {:msg (str "Import has unexpected error:\n" (error-str e))
+                                   :level :error
+                                   :ex-data {:error e}}))
+                   (throw (if (file-import-error? e)
+                            e
+                            (or (finalization-file-error e (:import-state options))
+                                (file-import-error nil e))))))))))
 
 (defn- default-save-file [conn path content]
   (ldb/transact! conn [{:file/path path
@@ -3356,12 +3633,34 @@
         (update-in [:zotero/settings-v2 "default" :zotero-data-directory] to-abs)
         (update-in [:zotero/settings-v2 "default" :zotero-linked-attachment-base-directory] to-abs))))
 
+(defn- default-config->map
+  [default-config]
+  (cond
+    (map? default-config) default-config
+    (and (string? default-config) (not (string/blank? default-config))) (edn/read-string default-config)
+    :else {}))
+
+(defn- transact-journal-title-format
+  [repo-or-conn config]
+  (when-let [title-format (or (:journal/page-title-format config) (:date-formatter config))]
+    (ldb/transact! repo-or-conn [{:db/ident :logseq.class/Journal
+                                  :logseq.property.journal/title-format title-format}]
+                   {::imported-data? true})))
+
 (defn export-config-file
-  "Exports logseq/config.edn by saving to database and setting any properties related to config"
+  "Exports logseq/config.edn by saving to database and setting any properties related to config.
+   When config-file is nil (e.g. a plain Markdown folder), the default config is used instead."
   [repo-or-conn config-file <read-file {:keys [<save-file notify-user default-config]
                                         :or {default-config {}
                                              <save-file default-save-file}}]
-  (-> (<read-file config-file)
+  (if (nil? config-file)
+    (let [config (default-config->map default-config)]
+      (-> (<save-file repo-or-conn "logseq/config.edn"
+                      (if (string? default-config) default-config (pr-str config)))
+          (p/then (fn [_]
+                    (transact-journal-title-format repo-or-conn config)
+                    config))))
+    (-> (<read-file config-file)
       (p/then #(p/do!
                 (<save-file repo-or-conn
                             "logseq/config.edn"
@@ -3369,17 +3668,14 @@
                             ;; manually dissoc deprecated keys for config to be valid
                             (pretty-print-dissoc % (keys common-config/file-only-config)))
                 (let [config (resolve-zotero-config-path (edn/read-string %) config-file)]
-                  (when-let [title-format (or (:journal/page-title-format config) (:date-formatter config))]
-                    (ldb/transact! repo-or-conn [{:db/ident :logseq.class/Journal
-                                                  :logseq.property.journal/title-format title-format}]
-                                   {::imported-data? true}))
+                  (transact-journal-title-format repo-or-conn config)
                   ;; Return original config as import process depends on original config e.g. :hidden
                   config)))
       (p/catch (fn [err]
                  (notify-user {:msg "Import may have mistakes due to an invalid config.edn. Recommend re-importing with a valid config.edn"
                                :level :error
                                :ex-data {:error err}})
-                 (edn/read-string default-config)))))
+                 (default-config->map default-config))))))
 
 (defn- export-class-properties
   [conn repo-or-conn]
@@ -3522,10 +3818,13 @@
   (when-let [favorites (seq (:favorites config))]
     (p/do!
      (if-let [favorited-ids
-              (seq (keep (fn [page-name]
-                           (some-> (get-imported-favorite-page @conn page-name)
-                                   :block/uuid))
-                         favorites))]
+              ;; OG renames could leave the same page in :favorites under
+              ;; several names (e.g. `foo` and `Foo`), so favorite each page once
+              (seq (distinct
+                    (keep (fn [page-name]
+                            (some-> (get-imported-favorite-page @conn page-name)
+                                    :block/uuid))
+                          favorites)))]
        (let [page-entity (ldb/get-page @conn common-config/favorites-page-name)]
          (insert-favorites repo favorited-ids (:db/id page-entity)))
        (log-fn :no-favorites-found {:favorites favorites})))))
@@ -3543,7 +3842,8 @@
        :import-state (new-import-state)
        :macros (or (:macros options) (:macros config))}
       (merge (select-keys options [:set-ui-state :<export-file :notify-user :<get-file-stat :on-tx-report
-                                   :import-watchdog :log-fn :import-timeout-ms :import-heartbeat-ms]))))
+                                   :import-watchdog :log-fn :import-timeout-ms :import-heartbeat-ms
+                                   :fail-fast? :rpath-key]))))
 
 (defn- move-top-parent-pages-to-library
   [conn repo-or-conn]
@@ -3556,7 +3856,11 @@
                                             parent (d/entity db (:v d))]
                                         (when (and (nil? (:block/parent parent)) (page-entity? child) (page-entity? parent))
                                           parent))))
-                              (common-util/distinct-by :block/uuid))
+                              (common-util/distinct-by :block/uuid)
+                              ;; Class and property schemas forbid :block/parent (and
+                              ;; class-page also forbids :block/order). Namespace
+                              ;; children stay parented to the class/property.
+                              (remove #(or (ldb/class? %) (ldb/property? %))))
         tx-data (map
                  (fn [parent]
                    {:db/id (:db/id parent)
@@ -3572,13 +3876,22 @@
                            (some-> (get f rpath-key) path/path-normalize))
         logseq-file? #(string/starts-with? (normalized-rpath %) "logseq/")
         asset-file? #(string/starts-with? (normalized-rpath %) "assets/")
+        doc-file? #(contains? #{"md" "org" "markdown" "edn"} (path/file-ext (:path %)))
         doc-files (->> files
                        (remove #(or (logseq-file? %) (asset-file? %)))
-                       (filter #(contains? #{"md" "org" "markdown" "edn"} (path/file-ext (:path %)))))]
+                       (filter doc-file?))]
     {:files files
+     ;; Removed by the :hidden config so they can be reported instead of
+     ;; silently dropped
+     :hidden-files (when (seq (:hidden config))
+                     (remove (set files) *files))
      :logseq-files (filter logseq-file? files)
      :asset-files (filter asset-file? files)
-     :doc-files doc-files}))
+     :doc-files doc-files
+     ;; Files outside logseq//assets/ that no importer handles, so they can be
+     ;; reported instead of silently dropped
+     :skipped-files (->> files
+                        (remove #(or (logseq-file? %) (asset-file? %) (doc-file? %))))}))
 
 (defn- <export-file-graph-steps
   [repo-or-conn conn config {:keys [files logseq-files asset-files doc-files]}
@@ -3597,7 +3910,7 @@
                                        {:assets (get-in doc-options [:import-state :assets])}))
      (import-progress! doc-options {:step :doc-files :total-files (count doc-files)})
      (export-doc-files conn doc-files <read-file (assoc doc-options :finalize-imported-graph? false))
-     (set-finishing-import-ui! set-ui-state)
+     (exporter-finalize/set-finishing-import-ui! set-ui-state)
      (import-progress! doc-options {:step :favorites})
      (export-favorites-from-config-edn conn repo-or-conn config
                                       (cond-> {}
@@ -3608,7 +3921,7 @@
      (move-top-parent-pages-to-library conn repo-or-conn)
      (import-progress! doc-options {:phase :finalize-imported-graph})
      (let [finalize-start (when log-fn (import-profile/now-ms))]
-       (finalize-imported-graph! conn)
+       (exporter-finalize/finalize-imported-graph! conn)
        (log-phase-ms! log-fn :finalize-imported-graph finalize-start {}))
      {:import-state (-> (:import-state doc-options)
                         (dissoc :assets))
@@ -3618,8 +3931,9 @@
   "Exports a file graph into a DB graph. Files is a seq of maps with :path.
   Options include :set-ui-state, :notify-user, :log-fn, :rpath-key, :<read-file,
   :<get-file-stat, :default-config, :user-options, :<save-config-file,
-  :<save-logseq-file, :<read-and-copy-asset, :import-timeout-ms, and
-  :import-heartbeat-ms. See export-doc-files for additional options."
+  :<save-logseq-file, :<read-and-copy-asset, :import-timeout-ms,
+  :import-heartbeat-ms, and :fail-fast? (default true). See export-doc-files
+  for additional options."
   [repo-or-conn conn config-file *files {:keys [<read-file <read-and-copy-asset rpath-key log-fn import-timeout-ms import-heartbeat-ms verbose]
                                          :or {rpath-key :path
                                               verbose false}
@@ -3646,6 +3960,12 @@
                             (set/rename-keys {:<save-config-file :<save-file})))
                 partitioned (partition-graph-files *files config rpath-key)
                 doc-options (build-doc-options config options)]
+          (doseq [skipped-file (:skipped-files partitioned)]
+            (swap! (get-in doc-options [:import-state :ignored-files]) conj
+                   {:path (get skipped-file rpath-key) :reason :unsupported-file-format}))
+          (doseq [hidden-file (:hidden-files partitioned)]
+            (swap! (get-in doc-options [:import-state :ignored-files]) conj
+                   {:path (get hidden-file rpath-key) :reason :hidden}))
           (<export-file-graph-steps repo-or-conn conn config partitioned
                                     <read-file <read-and-copy-asset doc-options options log-fn))
         (import-profile/with-import-watchdog watchdog)
@@ -3659,9 +3979,11 @@
                      (reset! gp-block/*export-to-db-graph? false)))
         (p/catch (fn [e]
                    (reset! gp-block/*export-to-db-graph? false)
-                   (js/console.error e)
-                   ((:notify-user options)
-                    {:msg (str "Import has unexpected error:\n" (.-message e))
-                     :level :error
-                     :ex-data {:error e}})
-                   (throw e))))))
+                   (when-not (file-import-error? e)
+                     (when-let [notify (:notify-user options)]
+                       (notify {:msg (str "Import has unexpected error:\n" (error-str e))
+                                :level :error
+                                :ex-data {:error e}})))
+                   (throw (if (file-import-error? e)
+                            e
+                            (file-import-error nil e))))))))

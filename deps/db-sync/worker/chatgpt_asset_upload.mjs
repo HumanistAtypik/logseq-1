@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-const MAX_ASSET_SIZE = 100 * 1024 * 1024;
+const MAX_ASSET_SIZE = 200 * 1024 * 1024;
 const MIME_TYPE_EXTENSIONS = new Map([
   ["image/png", "png"],
   ["image/jpeg", "jpg"],
@@ -19,7 +19,7 @@ function requiredFileLength(response) {
   }
   const size = Number(value);
   if (!Number.isSafeInteger(size) || size > MAX_ASSET_SIZE) {
-    throw new Error("ChatGPT file is larger than 100MB");
+    throw new Error("ChatGPT file is larger than 200 MiB");
   }
   return size;
 }
@@ -53,6 +53,27 @@ function resolvedFileName(file, downloadUrl, contentType) {
   return `${file.file_id}.${extension}`;
 }
 
+export async function assertUnencryptedGraph(graphId, { origin, authorization, env, ctx, workerFetch }) {
+  const url = new URL("/api/v1/graphs", origin);
+  url.searchParams.set("limit", "200");
+  do {
+    const response = await workerFetch(new Request(url, {
+      headers: authorization ? { authorization } : {},
+    }), env, ctx);
+    const result = await response.json();
+    if (!response.ok) throw new Error(`Logseq API request failed: ${response.status}`);
+    const graph = result.graphs.find((entry) => entry["graph-id"] === graphId);
+    if (graph) {
+      if (graph["graph-e2ee?"] !== false) {
+        throw new Error("This tool requires a plain graph; encrypt or decrypt asset bytes locally and use the REST API for encrypted graphs.");
+      }
+      return;
+    }
+    if (!result.cursor) throw new Error("graph not found");
+    url.searchParams.set("cursor", result.cursor);
+  } while (true);
+}
+
 export async function uploadChatGptAsset(input, dependencies) {
   const {
     origin,
@@ -66,6 +87,7 @@ export async function uploadChatGptAsset(input, dependencies) {
   const bucket = env.LOGSEQ_SYNC_ASSETS;
   if (!bucket) throw new Error("missing assets bucket");
 
+  await assertUnencryptedGraph(input.graphId, dependencies);
   const fileResponse = await fetchFile(downloadUrl);
   if (!fileResponse.ok || !fileResponse.body) {
     throw new Error(`ChatGPT file download failed: ${fileResponse.status}`);

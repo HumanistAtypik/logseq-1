@@ -33,7 +33,6 @@
             [frontend.handler.page :as page-handler]
             [frontend.handler.plugin :as plugin-handler]
             [frontend.handler.reaction :as reaction-handler]
-            [frontend.handler.repo :as repo-handler]
             [frontend.handler.route :as route-handler]
             [frontend.handler.user :as user-handler]
             [frontend.mobile.util :as mobile-util]
@@ -120,10 +119,11 @@
    (component-page/batch-delete-dialog selected-rows ok-handler)))
 
 (defevent! :modal/show-cards [[_ cards-id]]
-  (shui/dialog-open!
-   (fn [] (fsrs/cards-view cards-id nil))
-   {:id :srs
-    :label :flashcards__cp}))
+  (when (state/enable-flashcards?)
+    (shui/dialog-open!
+     (fn [] (fsrs/cards-view cards-id nil))
+     {:id :srs
+      :label :flashcards__cp})))
 
 (defevent! :modal/show-themes-modal [[_ classic?]]
   (if classic?
@@ -321,7 +321,7 @@
                     editing-target
                     (assoc :editing-target editing-target))]
       (p/do!
-       (editor-handler/save-current-block!)
+       (editor-handler/save-current-block! {:flush-input? true})
        (editor-new-property block target opts')))))
 
 (defn- reaction-target-block-ids [blocks]
@@ -500,26 +500,19 @@
 (defevent! :user/fetch-info-and-graphs [[_]]
   (state/set-state! [:ui/loading? :login] false)
   (async/go
-    (let [result (async/<! (user-handler/<user-info user-handler/remoteapi))]
-      (cond
-        (instance? ExceptionInfo result)
-        nil
-        (map? result)
-        (do
-          (state/set-user-info! result)
-          (when-let [uid (user-handler/user-uuid)]
-            (sentry-event/set-user! uid)
-            (ensure-user-rsa-keys-if-possible!))
-          (let [status (if (user-handler/alpha-or-beta-user?) :welcome :unavailable)
-                fetch-graphs? (and (user-handler/logged-in?)
-                                   (or (= status :welcome)
-                                       (user-handler/rtc-group?)))]
-            (when fetch-graphs?
-              (async/<! (p->c (rtc-handler/<get-remote-graphs)))
-              (repo-handler/refresh-repos!)
-              (when-let [current-repo (state/get-current-repo)]
-                (when (some #(= current-repo (:url %)) (state/get-rtc-graphs))
-                  (rtc-flows/trigger-rtc-start current-repo))))))))))
+    (let [session (state/get-state :auth/graph-session)
+          result (async/<! (user-handler/<user-info user-handler/remoteapi))]
+      (when (and session (= session (state/get-state :auth/graph-session)) (map? result))
+        (state/set-user-info! result)
+        (when-let [uid (user-handler/user-uuid)]
+          (sentry-event/set-user! uid)
+          (ensure-user-rsa-keys-if-possible!))
+        (when (user-handler/can-list-remote-graphs?)
+          (async/<! (p->c (rtc-handler/<get-remote-graphs)))
+          (when (= session (state/get-state :auth/graph-session))
+            (when-let [current-repo (state/get-current-repo)]
+              (when (some #(= current-repo (:url %)) (state/get-rtc-graphs))
+                (rtc-flows/trigger-rtc-start current-repo)))))))))
 
 (defevent! :dialog/show-block [[_ block option]]
   (shui/dialog-open!

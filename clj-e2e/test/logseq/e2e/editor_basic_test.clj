@@ -89,6 +89,105 @@
    ".ls-page-blocks .ls-block:not(.block-add-button) .bullet-container")
   (w/wait-for ".ls-context-menu-content"))
 
+(defn- open-page-context-menu!
+  []
+  (util/exit-edit)
+  (util/right-click "div[data-testid='page title']")
+  (w/wait-for ".ls-context-menu-content"))
+
+(defn- reset-uncaught-errors!
+  []
+  (w/eval-js
+   "() => {
+      window.__lsUncaughtErrors = [];
+      if (!window.__lsUncaughtErrorsInstalled) {
+        window.__lsUncaughtErrorsInstalled = true;
+        window.addEventListener('error', (event) => {
+          window.__lsUncaughtErrors.push(String(event.error || event.message || ''));
+        });
+      }
+      return true;
+    }"))
+
+(defn- uncaught-errors
+  []
+  (json/read-value
+   (w/eval-js "() => JSON.stringify(window.__lsUncaughtErrors || [])")))
+
+(defn- stack-overflow-messages
+  [messages]
+  (filter #(string/includes? (str %) "Maximum call stack size exceeded") messages))
+
+(defn- collect-page-errors!
+  [*errors]
+  (.onPageError (w/get-page)
+                (reify Consumer
+                  (accept [_ error]
+                    (swap! *errors conj (str error))))))
+
+(defn- assert-no-stack-overflow!
+  [*page-errors]
+  (let [console (->> (some-> custom-report/*pw-page->console-logs* deref vals)
+                     (mapcat identity))
+        overflows (concat (stack-overflow-messages @*page-errors)
+                          (stack-overflow-messages (uncaught-errors))
+                          (stack-overflow-messages console))]
+    (is (empty? overflows) (pr-str overflows))))
+
+(defn- highlight-context-menu-item!
+  []
+  (let [item (.first (w/-query ".ls-context-menu-content [role='menuitem']"))]
+    (.hover item)
+    item))
+
+(defn- leave-context-menu-by-tab!
+  "Press Tab until focus leaves the menu's content and the focus-out close
+  takes effect. Focusable controls inside the menu each take their own Tab
+  step, so a single press is not enough to exit."
+  []
+  (let [item (highlight-context-menu-item!)]
+    (.press item "Tab")
+    (loop [n 40]
+      (when (and (pos? n) (w/visible? ".ls-context-menu-content"))
+        (k/tab)
+        (recur (dec n))))))
+
+(defn- leave-context-menu-by-shift-tab!
+  []
+  (let [item (highlight-context-menu-item!)]
+    (.press item "Shift+Tab")))
+
+(deftest page-context-menu-tab-closes-without-stack-overflow-test
+  (let [*page-errors (atom [])]
+    (collect-page-errors! *page-errors)
+    (reset-uncaught-errors!)
+    (open-page-context-menu!)
+    (assert/assert-is-visible (loc/filter "[role='menuitem']" :has-text "Delete page"))
+    (leave-context-menu-by-tab!)
+    (w/wait-for-not-visible ".ls-context-menu-content")
+    (assert-no-stack-overflow! *page-errors)
+    (assert/assert-is-visible "div[data-testid='page title']")))
+
+(deftest page-context-menu-shift-tab-closes-without-stack-overflow-test
+  (let [*page-errors (atom [])]
+    (collect-page-errors! *page-errors)
+    (reset-uncaught-errors!)
+    (open-page-context-menu!)
+    (leave-context-menu-by-shift-tab!)
+    (w/wait-for-not-visible ".ls-context-menu-content")
+    (assert-no-stack-overflow! *page-errors)
+    (assert/assert-is-visible "div[data-testid='page title']")))
+
+(deftest block-context-menu-tab-does-not-overflow-test
+  (let [*page-errors (atom [])]
+    (collect-page-errors! *page-errors)
+    (reset-uncaught-errors!)
+    (open-block-context-menu!)
+    (leave-context-menu-by-tab!)
+    (w/wait-for-not-visible ".ls-context-menu-content")
+    (assert-no-stack-overflow! *page-errors)
+    (assert/assert-is-visible "div[data-testid='page title']")))
+
 (deftest block-context-menu-clickable-controls-use-pointer-test
   (open-block-context-menu!)
   (let [heading-button (w/-query "button[title='Auto heading']")
@@ -702,6 +801,65 @@
       (let [{:keys [journals-scroller-count] :as metrics} (journals-layout-metrics)]
         (is (= 1 journals-scroller-count) metrics)))))
 
+(defn- journals-rows-state
+  "Every rendered row of the virtualized journals list: whether it holds
+   page content or a placeholder, and the inline min-height on its item
+   (empty when the row is not pinned to a cached height)."
+  []
+  (js-json
+   "(() => {
+      const rows = Array.from(document.querySelectorAll('#journals [data-index]'));
+      return JSON.stringify(rows.map((row) => {
+        const item = row.querySelector('.journal-item');
+        return {index: row.dataset.index,
+                content: !!row.querySelector('.cp__page-inner-wrap'),
+                placeholder: !!row.querySelector('.journal-item-placeholder'),
+                minHeight: item ? item.style.minHeight : null};
+      }));
+    })()"))
+
+(defn- scroll-journals-down!
+  "Scrolls the main container down by `step` px `steps` times, a frame apart,
+   so the list passes through its scrolling state and pins the rows it
+   scrolls past. Returns the final scrollTop."
+  [step steps]
+  (w/eval-js
+   (format
+    "(async () => {
+      const scrollContainer = document.querySelector('#main-content-container');
+      const nextFrame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      for (let i = 0; i < %d; i++) {
+        scrollContainer.scrollTop += %d;
+        await nextFrame();
+      }
+      return scrollContainer.scrollTop;
+    })()"
+    steps step)))
+
+(deftest journals-list-rows-hold-no-pin-once-content-is-in
+  (testing "after a scroll, a journal row that holds content carries no inline min-height"
+    (seed-journals!
+     (mapv (fn [idx]
+             {:date (format "2026-03-%02dT12:00:00" idx)
+              :blocks [(format "journals pin block %02d" idx)]})
+           (range 1 31)))
+    (enable-virtualized-rendering!)
+    (w/wait-for "#journals [data-virtuoso-scroller]")
+    (w/wait-for "#journals [data-index]")
+    ;; Down to the end, then a third of the way back up: the rows rendered on
+    ;; the way back were placeholders pinned to a cached height moments ago.
+    (is (pos? (scroll-journals-down! 400 60)))
+    (util/wait-timeout 2000)
+    (let [rows-at-end (journals-rows-state)
+          _ (scroll-journals-down! -300 20)
+          _ (util/wait-timeout 3000)
+          rows-on-way-back (journals-rows-state)
+          rows (concat rows-at-end rows-on-way-back)
+          content-rows (filter :content rows)
+          pinned (filter #(and (:content %) (seq (:minHeight %))) rows)]
+      (is (< 2 (count content-rows)) (pr-str rows))
+      (is (empty? pinned) (pr-str pinned)))))
+
 (deftest journals-list-remounts-complete-long-journal-with-one-scroller
   (testing "an outer journal remount restores all content without a nested virtualizer"
     (let [first-block-title "journals remount stable block 001"
@@ -896,6 +1054,116 @@
     (is (nil? (ls-api-call! :editor.getBlock block-uuid)))
     (assert/assert-have-count (str "#ls-block-" block-uuid) 0)))
 
+(defn- wait-for-order-list!
+  [block-uuid present?]
+  (let [selector (str "#ls-block-" block-uuid " .as-order-list")]
+    (if present?
+      (w/wait-for selector)
+      (w/wait-for-not-visible selector))))
+
+(deftest backspace-deletes-empty-block-after-removing-ordered-list-test
+  (testing "after Backspace removes an ordered-list marker, the next Backspace deletes the empty block"
+    (let [journal (ls-api-call! :editor.createJournalPage
+                                (str (java.time.Instant/now)))]
+      (ls-api-call! :app.pushState "page" {:name (get journal "uuid")} nil)
+      (-> (w/-query "div[data-testid='page title'] .block-title-wrap")
+          assert/assert-that
+          (.hasText (get journal "title"))))
+    (b/open-last-block)
+    (when-not (string/blank? (or (util/get-edit-content) ""))
+      (b/new-block ""))
+    (util/press-seq "1. ")
+    (util/wait-edit-content "")
+    (let [first-uuid (.getAttribute (util/get-edit-block-container) "blockid")]
+      (wait-for-order-list! first-uuid true)
+      (util/press-seq "first")
+      (b/new-block "second")
+      (let [second-uuid (.getAttribute (util/get-edit-block-container) "blockid")]
+        (wait-for-order-list! second-uuid true)
+        (dotimes [_ (count "second")]
+          (k/backspace))
+        (util/wait-edit-content "")
+        (k/backspace)
+        (wait-for-order-list! second-uuid false)
+        (k/backspace)
+        (is (nil? (ls-api-call! :editor.getBlock second-uuid)))
+        (assert/assert-have-count (str "#ls-block-" second-uuid) 0)
+        (util/wait-edit-content "first")
+        (is (= first-uuid (.getAttribute (util/get-edit-block-container) "blockid")))))))
+
+(defn- press-keys-in-one-turn!
+  "Dispatch the keys in a single JS turn so they arrive while Enter's insert
+  is still pending in the db worker. Playwright's default slow-mo would
+  otherwise wait long enough for the insert to land between keys."
+  [keys]
+  (w/eval-js
+   "s => {
+      const keys = JSON.parse(s);
+      const keyCodeOf = (key) => {
+        if (key === 'Enter') return 13;
+        if (key === 'Backspace') return 8;
+        if (key === 'Tab') return 9;
+        if (key === 'Escape') return 27;
+        return key.toUpperCase().charCodeAt(0);
+      };
+      const codeOf = (key) => key.length === 1 ? ('Key' + key.toUpperCase()) : key;
+      const target = document.activeElement;
+      for (const key of keys) {
+        const keyCode = keyCodeOf(key);
+        const fire = (type) => {
+          const event = document.createEvent('Events');
+          event.initEvent(type, true, true);
+          event.key = key;
+          event.code = codeOf(key);
+          event.keyCode = keyCode;
+          event.which = keyCode;
+          target.dispatchEvent(event);
+        };
+        fire('keydown');
+        fire('keyup');
+      }
+    }"
+   (json/write-value-as-string keys)))
+
+(defn- page-block-titles
+  [page-name]
+  (mapv (fn [block]
+          (or (get block "content") (get block "title") ""))
+        (ls-api-call! :editor.getPageBlocksTree page-name)))
+
+(defn- fast-pending-insert-keys-leave-titles
+  [keys]
+  (assert/assert-editor-mode)
+  (let [page-name (p/get-page-name)]
+    (press-keys-in-one-turn! keys)
+    (util/wait-timeout 2500)
+    (util/exit-edit)
+    (page-block-titles page-name)))
+
+(deftest fast-enter-enter-backspace-keeps-the-new-empty-block-test
+  (testing "Enter, Enter, Backspace on an empty block while the insert is pending keeps two empty blocks"
+    (is (= ["" ""]
+           (fast-pending-insert-keys-leave-titles ["Enter" "Enter" "Backspace"])))))
+
+(deftest fast-enter-xy-backspace-keeps-typed-text-on-the-new-block-test
+  (testing "Enter, x, y, Backspace on an empty block while the insert is pending keeps the trimmed text on the new block"
+    (is (= ["" "x"]
+           (fast-pending-insert-keys-leave-titles ["Enter" "x" "y" "Backspace"])))))
+
+(deftest fast-enter-tab-backspace-keeps-the-indented-block-test
+  (testing "Enter, Tab, Backspace while insert and indent are pending keeps the new block nested"
+    (assert/assert-editor-mode)
+    (let [page-name (p/get-page-name)]
+      (press-keys-in-one-turn! ["Enter" "Tab" "Backspace"])
+      (util/wait-timeout 2500)
+      (util/exit-edit)
+      (let [tree (ls-api-call! :editor.getPageBlocksTree page-name)
+            child-titles (mapv (fn [block]
+                                 (or (get block "content") (get block "title") ""))
+                               (get (first tree) "children"))]
+        (is (= [""] (page-block-titles page-name)))
+        (is (= [""] child-titles))))))
+
 (deftest today-queries-render-without-resource-errors
   (let [page (ls-api-call! :editor.createJournalPage
                            (str (java.time.Instant/now)))]
@@ -1016,8 +1284,8 @@
       (b/new-block title)
       (util/exit-edit)
       (util/search title)
-      (assert/assert-is-visible
-       (loc/filter ".cp__cmdk .breadcrumb" :has-text page-name)))))
+      (let [breadcrumb (loc/filter ".cp__cmdk .breadcrumb" :has-text page-name)]
+        (util/repeat-until-visible 5 breadcrumb #(util/search title))))))
 
 (deftest comments-update-and-title-edit
   (testing "a submitted comment renders immediately and its thread title is editable"
@@ -1078,6 +1346,29 @@
     (b/indent)
     (b/new-block "another nested child")
     (b/indent)))
+
+(deftest page-icon-in-library
+  (testing "Library page entries show an icon only for the page's own or a tag icon"
+    (b/new-block "library icon source")
+    (util/set-tag "Page" {:hidden? true})
+    (assert/assert-is-visible ".ls-page-blocks .ls-block .ls-icon-file")
+    (p/goto-page "Library")
+    ;; a page with only the default icon stays a bullet in Library
+    (assert/assert-have-count
+     (-> ".ls-page-blocks .ls-block"
+         (loc/filter :has-text "library icon source")
+         (loc/filter :has ".ls-icon-file"))
+     0)
+    ;; a page's own icon still shows in Library
+    (p/goto-page "library icon source")
+    (w/click "button:text('Add icon')")
+    (w/fill ".cp__emoji-icon-picker input" "books")
+    (w/click ".cp__emoji-icon-picker button:has(em-emoji[id='books'])")
+    (p/goto-page "Library")
+    (assert/assert-is-visible
+     (-> ".ls-page-blocks .ls-block"
+         (loc/filter :has-text "library icon source")
+         (loc/filter :has "em-emoji[id='books']")))))
 
 (defn- selection-range
   []
@@ -1292,7 +1583,8 @@
           block-selector (format "#ls-block-%s" uuid)]
       (assert/assert-is-visible
        (loc/filter (str block-selector " .block-tag") :has-text "Task"))
-      (w/click (str block-selector " .block-title-wrap"))
+      (w/click (loc/filter (str block-selector " .block-title-wrap")
+                           :has-text "sample task"))
       (util/move-cursor-to-end)
       (util/input-command "Priority High")
       (util/exit-edit)
@@ -1302,7 +1594,8 @@
       (is (= "High"
              (get-in (ls-api-call! :editor.getBlock uuid)
                      [":logseq.property/priority" "title"])))
-      (w/click (str block-selector " .block-title-wrap"))
+      (w/click (loc/filter (str block-selector " .block-title-wrap")
+                           :has-text "sample task"))
       (util/move-cursor-to-end)
       (util/input-command "Scheduled")
       (w/click
@@ -1311,7 +1604,8 @@
       (assert/assert-is-visible
        (loc/filter (str block-selector " .bottom-property-pill")
                    :has-text "Scheduled"))
-      (w/click (str block-selector " .block-title-wrap"))
+      (w/click (loc/filter (str block-selector " .block-title-wrap")
+                           :has-text "sample task"))
       (util/move-cursor-to-end)
       (util/input-command "No priority")
       (util/exit-edit)
@@ -1393,6 +1687,28 @@
       (assert/assert-is-visible
        (format ".ls-page-blocks #ls-block-%s" uuid)))))
 
+(deftest collapsed-subtree-stays-collapsed-after-bullet-zoom-back-test
+  (testing "bullet zoom-in then back keeps the parent subtree collapsed"
+    (let [page-name (p/get-page-name)
+          parent (ls-api-call! :editor.appendBlockInPage page-name "zoom collapse parent")
+          uuid (get parent "uuid")
+          child-in-parent (loc/filter (format ".ls-page-blocks #ls-block-%s" uuid)
+                                      :has-text "zoom collapse child")]
+      (is (string? uuid))
+      (ls-api-call! :editor.insertBlock uuid "zoom collapse child" {:sibling false})
+      (w/click (format ".ls-page-blocks #control-%s" uuid))
+      (assert/assert-is-hidden child-in-parent)
+      (w/click (format ".ls-page-blocks #dot-%s" uuid))
+      (assert/assert-is-visible
+       (loc/filter "#main-content-container" :has-text "zoom collapse child"))
+      (is (string/includes? (or (w/eval-js "window.location.hash") "") uuid))
+      (.goBack (w/get-page))
+      (assert/assert-is-visible
+       (loc/filter ".ls-page-blocks" :has-text "zoom collapse parent"))
+      (assert/assert-is-hidden child-in-parent)
+      (is (false? (w/visible? child-in-parent))
+          "Parent view must keep the zoomed subtree collapsed after back"))))
+
 (deftest selection-direction-and-hierarchical-select-all-test
   (testing "range and select-all remain inside the current visible container"
     (b/new-blocks ["select a" "select b" "select c" "select d"])
@@ -1405,6 +1721,73 @@
     (k/press "ControlOrMeta+a")
     (assert/assert-have-count ".ls-page-blocks .ls-block.selected" 4)
     (assert/assert-have-count ".cp__right-sidebar .ls-block.selected" 0)))
+
+(defn- wait-selected-blockid!
+  [blockid]
+  (w/wait-for (format ".ls-page-blocks .ls-block.selected[blockid='%s']" blockid)))
+
+(deftest select-parent-expands-nested-block-to-page-test
+  (testing "Mod+A expands grandchild -> child -> parent -> whole page"
+    (let [page-name (p/get-page-name)
+          parent (ls-api-call! :editor.appendBlockInPage page-name "parent")
+          parent-uuid (get parent "uuid")
+          child (ls-api-call! :editor.insertBlock parent-uuid "child" {:sibling false})
+          child-uuid (get child "uuid")
+          grandchild (ls-api-call! :editor.insertBlock child-uuid "grandchild text" {:sibling false})
+          grandchild-uuid (get grandchild "uuid")]
+      (is (string? parent-uuid))
+      (ls-api-call! :editor.appendBlockInPage page-name "sibling top")
+      (w/click (loc/filter ".ls-page-blocks .block-title-wrap" :has-text "grandchild text"))
+      (assert/assert-editor-mode)
+      (k/press "ControlOrMeta+a")
+      (assert/assert-editor-mode)
+      (is (= "grandchild text" (util/get-edit-content)))
+      (k/press "ControlOrMeta+a")
+      (wait-selected-blockid! grandchild-uuid)
+      (assert/assert-have-count ".ls-page-blocks .ls-block.selected" 1)
+      (k/press "ControlOrMeta+a")
+      (wait-selected-blockid! child-uuid)
+      (assert/assert-have-count ".ls-page-blocks .ls-block.selected" 1)
+      (k/press "ControlOrMeta+a")
+      (wait-selected-blockid! parent-uuid)
+      (assert/assert-have-count ".ls-page-blocks .ls-block.selected" 1)
+      (k/press "ControlOrMeta+a")
+      (w/wait-for ".ls-page-blocks .ls-block.selected :text('sibling top')")
+      (assert/assert-is-visible
+       (loc/filter ".ls-page-blocks .ls-block.selected" :has-text "sibling top"))
+      (is (>= (.count (w/-query ".ls-page-blocks .ls-block.selected")) 4)
+          "Select-all should include the nested tree and the top-level sibling"))))
+
+(deftest select-parent-stops-at-zoomed-in-block-test
+  (testing "Mod+A inside a zoomed-in block expands to that block and then stops"
+    (let [page-name (p/get-page-name)
+          parent (ls-api-call! :editor.appendBlockInPage page-name "zoom parent")
+          parent-uuid (get parent "uuid")
+          child (ls-api-call! :editor.insertBlock parent-uuid "zoom child" {:sibling false})
+          child-uuid (get child "uuid")
+          grandchild (ls-api-call! :editor.insertBlock child-uuid "zoom grandchild" {:sibling false})
+          grandchild-uuid (get grandchild "uuid")]
+      (is (string? parent-uuid))
+      (ls-api-call! :editor.appendBlockInPage page-name "zoom sibling")
+      (w/click (format ".ls-page-blocks #dot-%s" parent-uuid))
+      (is (string/includes? (or (w/eval-js "window.location.hash") "") parent-uuid))
+      (w/click (loc/filter "#main-content-container .block-title-wrap" :has-text "zoom grandchild"))
+      (assert/assert-editor-mode)
+      (k/press "ControlOrMeta+a")
+      (k/press "ControlOrMeta+a")
+      (wait-selected-blockid! grandchild-uuid)
+      (k/press "ControlOrMeta+a")
+      (wait-selected-blockid! child-uuid)
+      (k/press "ControlOrMeta+a")
+      (wait-selected-blockid! parent-uuid)
+      (assert/assert-have-count ".ls-page-blocks .ls-block.selected" 1)
+      (k/press "ControlOrMeta+a")
+      (util/wait-timeout 300)
+      (wait-selected-blockid! parent-uuid)
+      (assert/assert-have-count ".ls-page-blocks .ls-block.selected" 1)
+      (assert/assert-have-count
+       (loc/filter ".ls-page-blocks .ls-block.selected" :has-text "zoom sibling")
+       0))))
 
 (deftest structured-and-plain-text-copy-test
   (testing "structured copy preserves trees while plain copy exposes readable indentation"
@@ -1625,3 +2008,177 @@
       (is (= "completion updated and focused" (util/get-edit-content)))
       (ls-api-call! :editor.removeBlock uuid)
       (assert/assert-have-count (str "#ls-block-" uuid) 0))))
+
+;; The caret helpers read a hidden mirror of the editing textarea, one per
+;; editor. A helper that resolves another editor's mirror, or none, returns no
+;; position, and the arrow key then does nothing at all: the caret stays on its
+;; row while the block still has rows above and below it. These two tests hold
+;; the behaviour through the content, so they need no access to the mirror.
+
+(def ^:private caret-row "abcdefghij klmnopqrst")
+
+(defn- block-of-three-rows!
+  "A block of 3 identical newline-separated rows, caret left at the end."
+  []
+  (b/new-block "")
+  (util/input (string/join "\n" [caret-row caret-row caret-row]))
+  (util/move-cursor-to-end)
+  (is (= (string/join "\n" [caret-row caret-row caret-row])
+         (util/get-edit-content))))
+
+(deftest arrow-up-down-move-the-caret-inside-a-block-test
+  (testing "up and down move the caret one row inside the block, not to another block"
+    (block-of-three-rows!)
+    (k/arrow-up)
+    (util/press-seq "X")
+    (is (= (string/join "\n" [caret-row (str caret-row "X") caret-row])
+           (util/get-edit-content))
+        "up from the end of the last row puts the caret at the end of the middle row")
+    (k/arrow-down)
+    (util/press-seq "Y")
+    (is (= (string/join "\n" [caret-row (str caret-row "X") (str caret-row "Y")])
+           (util/get-edit-content))
+        "down from the middle row puts the caret back on the last row")))
+
+(deftest shift-arrow-up-selects-inside-a-block-test
+  (testing "shift with up selects up to the previous row of the same block"
+    (block-of-three-rows!)
+    (k/shift+arrow-up)
+    (util/press-seq "Z")
+    (is (= (string/join "\n" [caret-row (str caret-row "Z")])
+           (util/get-edit-content))
+        "the selection covered the last row and the newline before it")))
+
+(defn- editor-box-heights
+  "clientHeight and scrollHeight of the editing textarea."
+  []
+  (json/read-value
+   (w/eval-js
+    "(() => {
+       const editor = document.querySelector('.editor-wrapper textarea');
+       return JSON.stringify({client: editor.clientHeight, scroll: editor.scrollHeight});
+     })();")
+   json/keyword-keys-object-mapper))
+
+(deftest heading-editor-shows-every-row-test
+  (testing "the editor of a heading block is sized for the heading font when it opens"
+    (let [title (string/join " " (repeat 12 "heading row"))]
+      ;; "# " at the start becomes the heading property, so the content is
+      ;; the title alone.
+      (b/new-block (str "# " title))
+      (util/exit-edit)
+      (w/click (loc/filter ".block-title-wrap" :has-text "heading row"))
+      (util/wait-editor-visible)
+      (is (= title (util/get-edit-content)))
+      (let [{:keys [client scroll]} (editor-box-heights)]
+        (is (<= scroll client)
+            (str "textarea clientHeight " client " scrollHeight " scroll))))))
+
+(deftest page-ref-navigate-persists-unsaved-edit-buffer-test
+  (testing "clicking a page-ref while editing flushes the editor so typed text is not lost (db-test#1250)"
+    (let [target-page (str "pageref-flush-target-" (random-uuid))
+          marker (str "pageref-flush-marker-" (random-uuid))
+          host-page (p/get-page-name)]
+      (p/new-page target-page)
+      (p/goto-page host-page)
+      (b/new-block (str "See [[" target-page "]] here"))
+      ;; Enter directly into a new empty block so the ref block renders without
+      ;; being clicked (clicking it could hit the page-ref link and navigate)
+      (b/new-block "")
+      (assert/assert-is-visible
+       (loc/filter ".page-reference .page-ref" :has-text target-page))
+      (is (= host-page (p/get-page-name)))
+      ;; type without idle autosave, then immediately navigate via page-ref
+      (w/fill util/editor-q marker)
+      (is (= marker (util/get-edit-content)))
+      (w/click
+       (.first (loc/filter ".page-reference .page-ref" :has-text target-page)))
+      (-> (w/-query "div[data-testid='page title'] .block-title-wrap")
+          assert/assert-that
+          (.hasText target-page))
+      (is (= target-page (p/get-page-name)))
+      (p/goto-page host-page)
+      (assert/assert-is-visible
+       (loc/filter ".ls-page-blocks .block-title-wrap" :has-text marker))
+      (is (some #(= marker %) (util/get-page-blocks-contents))))))
+
+(deftest shift-click-select-persists-unsaved-edit-buffer-test
+  (testing "shift+click block selection flushes the editor buffer (db-test#1250)"
+    (let [marker (str "shift-flush-marker-" (random-uuid))
+          shift-click (fn [text]
+                        (.click
+                         (.first (loc/filter ".ls-page-blocks .ls-block .block-content"
+                                             :has-text text))
+                         (doto (Locator$ClickOptions.)
+                           (.setModifiers [KeyboardModifier/SHIFT]))))]
+      (b/new-block "shift flush target one")
+      (b/new-block "shift flush target two")
+      (util/exit-edit)
+      ;; New empty block, type without idle autosave, then shift+click twice to
+      ;; select a range, which exits editing
+      (b/new-block "")
+      (w/fill util/editor-q marker)
+      (is (= marker (util/get-edit-content)))
+      (shift-click "shift flush target one")
+      (shift-click "shift flush target two")
+      (assert/assert-is-visible
+       (loc/filter ".ls-page-blocks .block-title-wrap" :has-text marker))
+      (is (some #(= marker %) (util/get-page-blocks-contents))))))
+
+(deftest page-ref-navigate-persists-edit-buffer-with-open-popup-test
+  (testing "clicking a page-ref while the page-search popup is open still flushes the editor"
+    (let [target-page (str "pageref-popup-target-" (random-uuid))
+          marker (str "pageref-popup-marker-" (random-uuid))
+          host-page (p/get-page-name)]
+      (p/new-page target-page)
+      (p/goto-page host-page)
+      (b/new-block (str "See [[" target-page "]] here"))
+      (b/new-block "")
+      (assert/assert-is-visible
+       (loc/filter ".page-reference .page-ref" :has-text target-page))
+      (is (= host-page (p/get-page-name)))
+      ;; typing "[[" opens the page-search popup, setting :editor/action
+      (util/press-seq (str marker " [[draft"))
+      (assert/assert-is-visible ".ui__popover-content a.menu-link")
+      (w/click
+       (.first (loc/filter ".page-reference .page-ref" :has-text target-page)))
+      (-> (w/-query "div[data-testid='page title'] .block-title-wrap")
+          assert/assert-that
+          (.hasText target-page))
+      (is (= target-page (p/get-page-name)))
+      (p/goto-page host-page)
+      (assert/assert-is-visible
+       (loc/filter ".ls-page-blocks .block-title-wrap" :has-text marker))
+      (is (some #(string/starts-with? % marker) (util/get-page-blocks-contents))))))
+
+(deftest page-title-slash-validation-keeps-title-editable-test
+  (testing "after a slash page-name error, letters can still be typed without reload"
+    (let [page-name (str "sample-title-" (random-uuid))
+          other-page (str "another-title-" (random-uuid))
+          toast (loc/filter ".ui__toast.warning" :has-text "Page name can't include")]
+      (p/new-page page-name)
+      (w/click "div[data-testid='page title'] .block-title-wrap")
+      (assert/assert-editor-mode)
+      (util/move-cursor-to-end)
+      (util/press-seq "/bad")
+      (k/enter)
+      (assert/assert-is-visible toast)
+      (assert/assert-editor-mode)
+      ;; Dismissing the toast moves focus to its close button, so type first.
+      (util/press-seq "z")
+      (is (= (str page-name "/badz") (util/get-edit-content))
+          "letters must still be accepted in this page title after the slash error")
+      (util/get-editor)
+      (util/move-cursor-to-end)
+      (util/press-seq "y")
+      (is (= (str page-name "/badzy") (util/get-edit-content))
+          "letters still work after the toast remains visible")
+      (w/fill util/editor-q (str page-name "-fixed"))
+      (util/exit-edit)
+      (p/new-page other-page)
+      (w/click "div[data-testid='page title'] .block-title-wrap")
+      (assert/assert-editor-mode)
+      (util/move-cursor-to-end)
+      (util/press-seq "abc")
+      (is (= (str other-page "abc") (util/get-edit-content))
+          "other page titles must stay editable after the slash error"))))

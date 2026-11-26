@@ -8,8 +8,32 @@ import {
 } from "./logseq_icon.mjs";
 import { ensureMcpAcceptHeader } from "./mcp_request.mjs";
 import { openAiAppsChallengeResponse } from "./openai_app_challenge.mjs";
+import { r2AssetUploadSigner } from "./r2_asset_upload.mjs";
 import { semanticRequestBody, semanticRequestUrl } from "./semantic_request.mjs";
 import { uploadChatGptAsset } from "./chatgpt_asset_upload.mjs";
+
+test("R2 presigned uploads bind the object, byte length, metadata, and write precondition", async () => {
+  const sign = r2AssetUploadSigner({
+    R2_ASSET_UPLOAD_BUCKET: "assets",
+    R2_ASSET_UPLOAD_ENDPOINT: "https://example.r2.cloudflarestorage.com/",
+    R2_ASSET_UPLOAD_ACCESS_KEY_ID: "fixture-access",
+    R2_ASSET_UPLOAD_SECRET_ACCESS_KEY: "fixture-secret",
+  });
+  const headers = {
+    "content-type": "text/plain",
+    "if-none-match": "*",
+    "x-amz-meta-checksum": "fixture",
+    "x-amz-meta-size": "209715200",
+    "x-amz-meta-type": "bin",
+  };
+  const signed = new URL(await sign("graph/test asset.bin", 279620315, headers));
+  const differentSize = new URL(await sign("graph/test asset.bin", 279620314, headers));
+  assert.equal(signed.pathname, "/assets/graph/test%20asset.bin");
+  assert.equal(signed.searchParams.get("X-Amz-Expires"), "600");
+  assert.equal(signed.searchParams.get("X-Amz-SignedHeaders"),
+    "content-length;content-type;host;if-none-match;x-amz-meta-checksum;x-amz-meta-size;x-amz-meta-type");
+  assert.notEqual(signed.searchParams.get("X-Amz-Signature"), differentSize.searchParams.get("X-Amz-Signature"));
+});
 
 test("OpenAI app domain challenge returns the configured token as plain text", async () => {
   const token = "openai-domain-verification-token";
@@ -62,6 +86,16 @@ test("Code Mode derives decoded asset size instead of trusting the agent", () =>
   }, "https://staging.example/mcp");
 
   assert.equal(url.searchParams.get("size"), "4");
+});
+
+test("Code Mode preserves the plaintext size of encrypted asset packages", () => {
+  const encrypted = '["~bAAAAAAAAAAAAAAAA","~b' + btoa("a".repeat(28)) + '"]';
+  const url = semanticRequestUrl({
+    path: "/api/v1/graphs/graph-1/assets",
+    query: { encoding: "base64", size: 12, title: encrypted, checksum: "a".repeat(64) },
+    body: btoa(encrypted),
+  }, "https://api.logseq.io/mcp");
+  assert.equal(url.searchParams.get("size"), "12");
 });
 
 test("Code Mode rejects invalid base64 before forwarding", () => {
@@ -189,6 +223,9 @@ test("ChatGPT asset upload preserves the original bytes and derives metadata", a
       headers: { "content-length": String(original.byteLength), "content-type": "image/jpeg" },
     }),
     workerFetch: async (request) => {
+      if (new URL(request.url).pathname === "/api/v1/graphs") {
+        return Response.json({ graphs: [{ "graph-id": "graph-1", "graph-e2ee?": false }] });
+      }
       semanticRequest = request;
       const uploaded = new Uint8Array(await request.arrayBuffer());
       assert.deepEqual(uploaded, original);
@@ -220,6 +257,7 @@ test("ChatGPT asset upload rejects missing length without buffering the file", a
   }, {
     origin: "https://api.logseq.io",
     env: { LOGSEQ_SYNC_ASSETS: {} },
+    workerFetch: async () => Response.json({ graphs: [{ "graph-id": "graph-1", "graph-e2ee?": false }] }),
     fetchFile: async () => new Response(new Uint8Array([1, 2, 3])),
   }), /content-length/);
 });
@@ -308,4 +346,35 @@ test("MCP requests that already support streamable HTTP are preserved", () => {
   });
 
   assert.equal(ensureMcpAcceptHeader(request), request);
+});
+
+
+test("ChatGPT rejects encrypted graphs before downloading or storing plaintext attachments", async () => {
+  let downloads = 0;
+  let uploads = 0;
+  await assert.rejects(() => uploadChatGptAsset({
+    graphId: "graph-1",
+    file: { download_url: "https://files.openai.example/logo.jpg", file_id: "file-1" },
+  }, {
+    origin: "https://api.logseq.io",
+    authorization: "Bearer token",
+    env: { LOGSEQ_SYNC_ASSETS: {
+      put: async (_key, body) => { uploads += 1; await new Response(body).arrayBuffer(); },
+      get: async () => ({ body: new Response(new Uint8Array([1, 2, 3])).body }),
+      delete: async () => {},
+    } },
+    workerFetch: async (request) => {
+      if (new URL(request.url).pathname !== "/api/v1/graphs") {
+        return Response.json({ uuid: "asset-1" }, { status: 201 });
+      }
+      assert.equal(request.headers.get("authorization"), "Bearer token");
+      return Response.json({ graphs: [{ "graph-id": "graph-1", "graph-e2ee?": true }] });
+    },
+    fetchFile: async () => {
+      downloads += 1;
+      return new Response(new Uint8Array([1, 2, 3]), { headers: { "content-length": "3" } });
+    },
+  }), /encrypted graphs/);
+  assert.equal(downloads, 0);
+  assert.equal(uploads, 0);
 });

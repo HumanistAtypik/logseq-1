@@ -1,5 +1,5 @@
 (ns frontend.worker.db-worker-test
-  (:require [cljs.test :refer [async deftest is]]
+  (:require [cljs.test :refer [async deftest is use-fixtures]]
             [clojure.string :as string]
             [datascript.core :as d]
             [frontend.common.thread-api :as thread-api]
@@ -24,6 +24,19 @@
 (def ^:private rtc-log-orig rtc-log-and-state/rtc-log)
 (def ^:private update-local-tx-orig client-op/update-local-tx)
 (def ^:private broadcast-to-clients-orig shared-service/broadcast-to-clients!)
+
+;; The cleanup of an async test's `restoring-worker-state`, run by the :after
+;; fixture: cljs.test runs it once the test called `done` and before the next
+;; test starts. Chained after the test's promise, it ran after `done`, in the
+;; middle of the next test, and reset the platform and the vars that test had
+;; just set.
+(defonce ^:private *pending-cleanup (atom nil))
+
+(use-fixtures :each
+  {:after (fn []
+            (when-let [cleanup @*pending-cleanup]
+              (reset! *pending-cleanup nil)
+              (cleanup)))})
 ;; Keep this compact to satisfy lint:large-vars while still checking full coverage.
 (def ^:private expected-db-core-thread-apis
   (into #{}
@@ -44,7 +57,7 @@
           :thread-api/reset-db :thread-api/get-file-content :thread-api/get-all-properties
           :thread-api/get-date-scheduled-or-deadlines
           :thread-api/unsafe-unlink-db :thread-api/close-db
-          :thread-api/db-sync-close-db :thread-api/db-sync-invalidate-search-db :thread-api/db-sync-recreate-lock
+          :thread-api/db-sync-close-db :thread-api/db-sync-invalidate-search-db
           :thread-api/db-sync-rehydrate-large-titles :thread-api/db-sync-import-prepare :thread-api/db-sync-import-rows-chunk
           :thread-api/db-sync-import-finalize :thread-api/release-access-handles :thread-api/db-exists
           :thread-api/export-db-binary :thread-api/import-file-graph
@@ -55,7 +68,7 @@
           :thread-api/markdown-mirror-set-enabled :thread-api/markdown-mirror-flush :thread-api/markdown-mirror-regenerate
           :thread-api/export-get-debug-datoms :thread-api/export-get-all-page->content :thread-api/validate-db
           :thread-api/recompute-checksum-diagnostics :thread-api/export-edn :thread-api/import-edn
-          :thread-api/get-fsrs-due-card-block-ids :thread-api/get-view-data
+          :thread-api/get-fsrs-due-card-block-ids :thread-api/get-fsrs-card-block-ids :thread-api/get-view-data
           :thread-api/get-class-objects :thread-api/validate-block-tag
           :thread-api/convert-tag-to-page
           :thread-api/convert-page-to-tag
@@ -156,7 +169,8 @@
     (reset! worker-state/*sqlite #js {})
     (let [result (f)]
       (if (p/promise? result)
-        (p/finally result cleanup)
+        (do (reset! *pending-cleanup cleanup)
+            result)
         (do
           (cleanup)
           result)))))
@@ -284,7 +298,7 @@
   ([repo conn f]
    (with-fake-create-or-open-db repo conn {} f))
   ([repo conn
-    {:keys [create-or-open-db-f close-db-f invalidate-search-db-f unlink-db-f recreate-lock-f]}
+    {:keys [create-or-open-db-f close-db-f invalidate-search-db-f unlink-db-f]}
     f]
    (let [thread-apis-prev @thread-api/*thread-apis
          create-or-open-db-f (or create-or-open-db-f
@@ -293,15 +307,13 @@
                                    (p/resolved nil)))
          close-db-f (or close-db-f (fn [_repo] nil))
          invalidate-search-db-f (or invalidate-search-db-f (fn [_repo] (p/resolved nil)))
-         unlink-db-f (or unlink-db-f (fn [_repo] nil))
-         recreate-lock-f (or recreate-lock-f (fn [_repo] (p/resolved nil)))]
+         unlink-db-f (or unlink-db-f (fn [_repo] nil))]
      (vreset! thread-api/*thread-apis
               (assoc thread-apis-prev
                      :thread-api/create-or-open-db create-or-open-db-f
                      :thread-api/db-sync-close-db close-db-f
                      :thread-api/db-sync-invalidate-search-db invalidate-search-db-f
-                     :thread-api/unsafe-unlink-db unlink-db-f
-                     :thread-api/db-sync-recreate-lock recreate-lock-f))
+                     :thread-api/unsafe-unlink-db unlink-db-f))
      (-> (f)
          (p/finally (fn []
                       (vreset! thread-api/*thread-apis thread-apis-prev)))))))
@@ -343,9 +355,6 @@
             :unlink-db-f (fn [repo]
                            (swap! calls conj [:unlink repo])
                            nil)
-            :recreate-lock-f (fn [repo]
-                               (swap! calls conj [:recreate-lock repo])
-                               (p/resolved nil))
             :invalidate-search-db-f (fn [repo]
                                       (swap! calls conj [:invalidate-search repo])
                                       (p/resolved nil))
@@ -363,12 +372,10 @@
                                                             ops)))]
                              (is (some? (idx :close)))
                              (is (some? (idx :unlink)))
-                             (is (some? (idx :recreate-lock)))
                              (is (some? (idx :invalidate-search)))
                              (is (some? (idx :create-or-open)))
                              (is (< (idx :close) (idx :unlink)))
-                             (is (< (idx :unlink) (idx :recreate-lock)))
-                             (is (< (idx :recreate-lock) (idx :invalidate-search)))
+                             (is (< (idx :unlink) (idx :invalidate-search)))
                              (is (< (idx :invalidate-search) (idx :create-or-open))))
                            (done)))
                  (p/catch (fn [error]
@@ -385,6 +392,8 @@
               (with-fake-create-or-open-db
                 test-repo conn
                 (fn []
+                  ;; done after p/with-redefs has put the vars back, not inside it: otherwise
+                  ;; the next test in the process starts with broadcast-to-clients! still redefined
                   (-> (p/with-redefs [rtc-log-and-state/rtc-log (fn [& _] nil)
                                       client-op/update-local-tx (fn [& _] nil)
                                       shared-service/broadcast-to-clients! (fn [& _] nil)]
@@ -392,13 +401,11 @@
                                 second-import (prepare test-repo true "graph-1" false)
                                 stale-outcome (capture-outcome #(finalize test-repo "graph-1" 42 (:import-id first-import)))]
                           (is (= :db-sync/stale-import (some-> stale-outcome :error ex-data :type)))
-                          (-> (finalize test-repo "graph-1" 42 (:import-id second-import))
-                              (p/then (fn [_]
-                                        (is true)
-                                        (done))))))
+                          (finalize test-repo "graph-1" 42 (:import-id second-import))))
+                      (p/then (fn [_] (is true)))
                       (p/catch (fn [error]
-                                 (is false (str error))
-                                 (done)))))))))))
+                                 (is false (str error))))
+                      (p/finally (fn [] (done)))))))))))
 
 (deftest db-sync-import-finalize-cleans-temp-pool-on-success-test
   (async done
@@ -455,8 +462,7 @@
               (-> (p/with-redefs [rtc-log-and-state/rtc-log (fn [& _] nil)
                                   sync-download/fetch-json (fn [_url _opts schema]
                                                              (case schema
-                                                               :sync/pull (p/resolved {:t 77})
-                                                               :sync/snapshot-download (p/resolved {:url "https://snapshot.example.test"})
+                                                               :sync/snapshot-download (p/resolved {:t 77 :url "https://snapshot.example.test"})
                                                                (p/rejected (ex-info "unexpected schema" {:schema schema}))))
                                   sync-download/prepare-import! (fn [repo _reset? gid _graph-e2ee? & _]
                                                                   (reset! @#'sync-download/*import-state

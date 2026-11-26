@@ -6,6 +6,7 @@
             [frontend.worker.db.migrate :as db-migrate]
             [frontend.worker.shared-service :as shared-service]
             [logseq.db :as ldb]
+            [logseq.db.common.order :as db-order]
             [logseq.db-sync.checksum :as sync-checksum]
             [logseq.db.frontend.class :as db-class]
             [logseq.db.frontend.validate :as db-validate]))
@@ -291,14 +292,24 @@
       (recur (validate-db-result @conn))
       result)))
 
+(defn- fix-missing-internal-page-parent-orders!
+  [conn]
+  (let [tx-data (db-order/missing-internal-page-parent-order-tx @conn)]
+    (when (seq tx-data)
+      (let [report (ldb/transact! conn tx-data {:fix-db? true})]
+        (doseq [order (keep :block/order tx-data)]
+          (db-order/reset-max-key! order))
+        report))))
+
 (defn validate-db
-  [conn & {:keys [fix] :or {fix true}}]
+  [conn & {:keys [fix silent?] :or {fix true}}]
   (when fix
     (fix-extends-cardinality! conn)
     (fix-icon-wrong-type! conn)
     (db-migrate/ensure-built-in-data-exists! conn)
     (fix-non-closed-values! conn)
-    (fix-num-prefix-db-idents! conn))
+    (fix-num-prefix-db-idents! conn)
+    (fix-missing-internal-page-parent-orders! conn))
 
   (let [{:keys [errors datom-count entities invalid-entity-ids]}
         (if fix
@@ -309,20 +320,21 @@
         db @conn
         counts (assoc (db-validate/graph-counts db entities) :datoms datom-count)]
 
-    (if errors
-      (do
-        (shared-service/broadcast-to-clients! :log [:db-invalid :error
-                                                    {:msg "Validation errors"
-                                                     :errors errors}])
-        (shared-service/broadcast-to-clients! :notification
-                                              [(str "Validation detected " (count errors) " invalid block(s). These blocks may be buggy."
-                                                    (when fix
-                                                      " Attempting to fix invalid blocks. Run validation again to see if they were fixed."))
-                                               :warning false]))
+    (when-not silent?
+      (if errors
+        (do
+          (shared-service/broadcast-to-clients! :log [:db-invalid :error
+                                                      {:msg "Validation errors"
+                                                       :errors errors}])
+          (shared-service/broadcast-to-clients! :notification
+                                                [(str "Validation detected " (count errors) " invalid block(s). These blocks may be buggy."
+                                                      (when fix
+                                                        " Attempting to fix invalid blocks. Run validation again to see if they were fixed."))
+                                                 :warning false]))
 
-      (shared-service/broadcast-to-clients! :notification
-                                            [(str "Your graph is valid! " counts)
-                                             :success false]))
+        (shared-service/broadcast-to-clients! :notification
+                                              [(str "Your graph is valid! " counts)
+                                               :success false])))
     (merge {:errors errors
             :invalid-entity-ids invalid-entity-ids}
            counts)))

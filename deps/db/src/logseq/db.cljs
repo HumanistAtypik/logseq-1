@@ -128,11 +128,22 @@
   [tx-meta]
   (not (:fix-db? tx-meta)))
 
+(defn- error->log-str
+  [error]
+  (or (ex-message error)
+      (when (instance? js/Error error)
+        (.-message error))
+      (when (string? error) error)
+      (try (pr-str error)
+           (catch :default _ "[unprintable error]"))))
+
 (defn- transact-failed-log-data
   [tx-meta tx-data error]
-  {:tx-meta tx-meta
-   :tx-count (count tx-data)
-   :error (str error)})
+  (cond-> {:tx-meta tx-meta
+           :tx-count (count tx-data)
+           :error (error->log-str error)}
+    (map? (ex-data error))
+    (assoc :error-data (select-keys (ex-data error) [:code :error :path :entity-id]))))
 
 (defn- invalid-tx-log-data
   [tx-meta tx-data errors tx-report]
@@ -194,7 +205,9 @@
   ([repo-or-conn tx-data]
    (transact! repo-or-conn tx-data nil))
   ([repo-or-conn tx-data tx-meta]
-   (let [tx-data (->> tx-data
+   (let [expand-tx? (and (not (string? repo-or-conn))
+                         (not (:replay-datoms? tx-meta)))
+         tx-data (->> tx-data
                       entity->db-id
                       (map (fn [m]
                              (if (map? m)
@@ -211,12 +224,13 @@
                       (remove (fn [m] (or ;; db/id
                                        (integer? m)
                                        (empty? m)))))
-         tx-data (if-not (string? repo-or-conn)
+         tx-data (if expand-tx?
                    (delete-blocks/expand-delete-blocks-tx @repo-or-conn tx-data tx-meta)
                    tx-data)
-         delete-blocks-tx (when-not (string? repo-or-conn)
+         delete-blocks-tx (when expand-tx?
                             (delete-blocks/update-refs-history @repo-or-conn tx-data tx-meta))
-         tx-data (concat tx-data delete-blocks-tx)]
+         tx-data (concat tx-data delete-blocks-tx)
+         tx-meta (dissoc tx-meta :replay-datoms?)]
 
      ;; Ensure worker can handle the request sequentially (one by one)
      ;; Because UI assumes that the in-memory db has all the data except the last one transaction
@@ -259,6 +273,17 @@
            :skip-store? true
            :skip-validate-db? true)))
 
+(defn- datoms->tx-ops
+  "Convert collected Datoms into add/retract ops without their inner tx ids.
+
+  Datascript inserts a Datom with its own :tx and increments :max-tx once per
+  transact!. Replaying inner Datoms would leave :max-tx behind those txs, so the
+  next transact! could reuse a tx id an existing datom already carries."
+  [datoms]
+  (mapv (fn [d]
+          [(if (:added d) :db/add :db/retract) (:e d) (:a d) (:v d)])
+        datoms))
+
 (defn batch-transact-with-temp-conn!
   "Run batched tx work against a temporary conn, then apply all collected tx-data
   to `conn` with a single final `transact!`.
@@ -269,13 +294,18 @@
     (`:skip-store? true`).
   - Defers db validation during inner batch ops (`:skip-validate-db? true`), then
     validates on the final `transact!` to `conn`.
+  - Replays collected changes as add/retract ops so the final transact! stamps
+    one new tx id. Inner temp-conn tx ids are not preserved. Replay skips
+    delete-blocks expansion because the collected Datoms are already expanded.
   - Supports nested usage.
 
   Notes:
   - `batch-tx-fn` is called as `(batch-tx-fn temp-conn *batch-tx-data)`.
   - `listen-db` (if provided) receives each intermediate tx-report from temp conn.
+  - `transform-tx-meta` runs after the batch body to finalize operation metadata.
   - Do not rely on returned tx-report shape for undo/redo behavior."
-  [conn tx-meta batch-tx-fn & {:keys [listen-db before-commit]}]
+  [conn tx-meta batch-tx-fn & {:keys [listen-db before-commit transform-tx-meta]
+                             :or {transform-tx-meta identity}}]
   (let [temp-conn (temp-conn-from-db @conn)
         *batch-tx-data (volatile! [])
         *complete? (volatile! false)]
@@ -296,7 +326,9 @@
       (let [tx-data @*batch-tx-data]
         (when (and @*complete? (seq tx-data))
           ;; transact tx-data to `conn` and validate db
-          (transact! conn tx-data tx-meta)))
+          (transact! conn
+                     (datoms->tx-ops tx-data)
+                     (assoc (transform-tx-meta tx-meta) :replay-datoms? true))))
       (finally
         (d/unlisten! temp-conn ::temp-conn-batch-tx)
         (reset! temp-conn nil)
@@ -360,12 +392,15 @@
 (def journal? entity-util/journal?)
 (def hidden? entity-util/hidden?)
 (def recycled? entity-util/recycled?)
+(def some-parent entity-util/some-parent)
 (def object? entity-util/object?)
 (def asset? entity-util/asset?)
 (def public-built-in-property? db-property/public-built-in-property?)
 (def get-entity-types entity-util/get-entity-types)
 (def internal-tags db-class/internal-tags)
 (def private-tags db-class/private-tags)
+(def private-tag-titles db-class/private-tag-titles)
+(def private-create-page-tag? db-class/private-create-page-tag?)
 (def extends-hidden-tags db-class/extends-hidden-tags)
 (def hidden-tags db-class/hidden-tags)
 
@@ -411,7 +446,7 @@
         closed-property (:block/closed-value-property block)]
     (sort-by-order (cond
                      closed-property
-                     (:block/_closed-value-property closed-property)
+                     (mapcat :block/_closed-value-property closed-property)
 
                      from-property
                      (filter (fn [e]
@@ -444,8 +479,8 @@
                         child-order (some-> (d/datoms db :eavt child-id :block/order) first :v)]
                     (if (and child-order
                              (eligible? (compare child-order block-order))
-                             (not (seq (d/datoms db :avet :logseq.property/created-from-property child-id)))
-                             (not (seq (d/datoms db :avet :block/closed-value-property child-id)))
+                             (not (seq (d/datoms db :eavt child-id :logseq.property/created-from-property)))
+                             (not (seq (d/datoms db :eavt child-id :block/closed-value-property)))
                              (or (nil? best-order)
                                  (closer? (compare child-order best-order))))
                       [child-id child-order]
@@ -683,28 +718,56 @@
 (def get-block-children-ids common-initial-data/get-block-children-ids)
 (def get-block-full-children-ids common-initial-data/get-block-full-children-ids)
 
-(defn- get-sorted-page-block-ids
-  [db page-id]
-  (let [root (d/entity db page-id)]
-    (loop [result []
-           children (sort-by-order (:block/_parent root))]
-      (if (seq children)
-        (let [child (first children)]
-          (recur (conj result (:db/id child))
-                 (concat
-                  (sort-by-order (:block/_parent child))
-                  (rest children))))
-        result))))
+(defn- block-order-path
+  "The :block/order keys from the page's top-level children down to `block`,
+   sorted root-first. Comparing two paths lexicographically gives the same
+   relative order as a full preorder traversal of the page.
+   Returns nil when `block` isn't reachable from the page through :block/_parent
+   (e.g. property-created blocks)."
+  [page-id block]
+  (loop [block block
+         path ()]
+    (if (or (:logseq.property/created-from-property block)
+            (:block/closed-value-property block))
+      nil
+      (let [parent (:block/parent block)
+            path (cons (:block/order block) path)]
+        (cond
+          (nil? parent)
+          nil
+
+          (= page-id (:db/id parent))
+          (vec path)
+
+          :else
+          (recur parent path))))))
+
+(defn- compare-order-paths
+  [path-1 path-2]
+  (loop [path-1 (seq path-1)
+         path-2 (seq path-2)]
+    (cond
+      (and (nil? path-1) (nil? path-2)) 0
+      (nil? path-1) -1
+      (nil? path-2) 1
+      :else (let [c (compare (first path-1) (first path-2))]
+              (if (zero? c)
+                (recur (next path-1) (next path-2))
+                c)))))
 
 (defn sort-page-random-blocks
   "Blocks could be non consecutive."
-  [db blocks]
+  [_db blocks]
   (assert (every? #(= (:block/page %) (:block/page (first blocks))) blocks) "Blocks must to be in a same page.")
-  (let [page-id (:db/id (:block/page (first blocks)))
-        ;; TODO: there's no need to sort all the blocks
-        sorted-ids (get-sorted-page-block-ids db page-id)
-        blocks-map (zipmap (map :db/id blocks) blocks)]
-    (keep blocks-map sorted-ids)))
+  (let [page-id (:db/id (:block/page (first blocks)))]
+    (->> blocks
+         (keep (fn [block]
+                 (when-let [path (block-order-path page-id block)]
+                   [path block])))
+         (sort (fn [[path-1 _] [path-2 _]]
+                 (compare-order-paths path-1 path-2)))
+         (map second)
+         (distinct))))
 
 (defn last-child-block?
   "The child block could be collapsed."

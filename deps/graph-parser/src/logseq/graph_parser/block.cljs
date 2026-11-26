@@ -306,7 +306,9 @@
       (if day
         (let [original-page-name' (date-time-util/int->journal-title day date-formatter)
               default-journal-page-name (date-time-util/int->journal-title day date-time-util/default-journal-title-formatter)]
-          [original-page-name' (common-util/page-name-sanity-lc default-journal-page-name) day])
+          [original-page-name'
+           (common-util/page-name-sanity-lc (if export-to-db-graph? original-page-name' default-journal-page-name))
+           day])
         [original-page-name page-name day]))))
 
 (def convert-page-if-journal (memoize convert-page-if-journal-impl))
@@ -320,6 +322,13 @@
   (when (and db (string? page-name))
     (d/entity db
               (first (sort (map :e (entity-util/get-pages-by-name db page-name)))))))
+
+(defn- stored-block-attr
+  "Read a scalar from datoms. Journal `:block/title` on Entity is computed from
+  `title-format` and must not be used as a write-back value."
+  [db eid attr]
+  (when (and db eid)
+    (:v (first (d/datoms db :eavt eid attr)))))
 
 (defn- page-name-string->map
   [original-page-name db date-formatter
@@ -346,10 +355,15 @@
 
                         :else
                         (get-page db original-page-name')))
-        original-page-name' (or from-page (:block/title page-entity) original-page-name')
-        page-name' (if (and journal-day page-entity)
-                     (:block/name page-entity)
-                     page-name)
+        original-page-name' (or from-page
+                                (stored-block-attr db (:db/id page-entity) :block/title)
+                                original-page-name')
+        page-name' (cond
+                     (and journal-day page-entity)
+                     (stored-block-attr db (:db/id page-entity) :block/name)
+                     (and journal-day (or db-based? @*export-to-db-graph?))
+                     (common-util/page-name-sanity-lc original-page-name')
+                     :else page-name)
         page (merge
               {:block/name page-name'
                :block/title original-page-name'}
@@ -617,9 +631,11 @@
     (mapv macro->block @*result)))
 
 (defn with-pre-block-if-exists
-  [blocks body pre-block-properties encoded-content {:keys [db date-formatter]}]
+  [blocks body pre-block-properties encoded-content {:keys [db date-formatter export-to-db-graph? format]
+                                                    :or {format :markdown}}]
   (let [first-block (first blocks)
         first-block-start-pos (get-in first-block [:block/meta :start_pos])
+        format' (or (:block/format first-block) format)
 
         ;; Add pre-block
         blocks (if (or (> first-block-start-pos 0)
@@ -634,16 +650,22 @@
                                             (map (fn [page]
                                                    (:block/title (page-name->map page db true date-formatter)))))
                          pre-block? (if (:heading properties) false true)
-                         block {:block/uuid id
-                                :block/title content
-                                :block/level 1
-                                :block/properties properties
-                                :block/properties-order (vec properties-order)
-                                :block/properties-text-values properties-text-values
-                                :block/invalid-properties invalid-properties
-                                :block/pre-block? pre-block?
-                                :block/macros (extract-macros-from-ast body)
-                                :block.temp/ast-body body}
+                         title (if export-to-db-graph?
+                                 (string/trim (gp-property/remove-properties format' content))
+                                 content)
+                         block (cond-> {:block/uuid id
+                                        :block/title title
+                                        :block/level 1
+                                        :block/properties properties
+                                        :block/properties-order (vec properties-order)
+                                        :block/properties-text-values properties-text-values
+                                        :block/invalid-properties invalid-properties
+                                        :block/pre-block? pre-block?
+                                        :block.temp/ast-body body}
+                                 export-to-db-graph?
+                                 (assoc :block.temp/ast-blocks body)
+                                 (not export-to-db-graph?)
+                                 (assoc :block/macros (extract-macros-from-ast body)))
                          {:keys [tags refs]}
                          (with-page-block-refs {:body body :refs property-refs} db date-formatter {})]
                      (cond-> block
@@ -651,7 +673,8 @@
                        (assoc :block/tags tags)
                        true
                        (assoc :block/refs (concat refs (:block-refs pre-block-properties)))))
-                   (select-keys first-block [:block/format :block/page]))
+                   (cond-> (select-keys first-block [:block/format :block/page])
+                     format' (assoc :block/format format')))
                   blocks)
                  blocks)]
     blocks))
@@ -705,7 +728,7 @@
                 block)
         title (cond->> (get-block-content encoded-content block format pos-meta block-pattern)
                 remove-properties?
-                (gp-property/remove-properties (get block :format :markdown))
+                (#(gp-property/remove-properties (get block :format :markdown) % (:marker block)))
                 remove-logbook?
                 (gp-property/remove-logbook)
                 remove-deadline-scheduled?
@@ -801,7 +824,7 @@
                                   ;; fix start_pos
                                   (assoc pos-meta :end_pos
                                          (if (seq headings)
-                                           (get-in (last headings) [:meta :start_pos])
+                                           (get-in (peek headings) [:meta :start_pos])
                                            nil)))
                       ;; Remove properties, deadline/scheduled and logbook text from title in db graphs
                       options' (assoc options
@@ -827,7 +850,7 @@
                  sanity-blocks-data)
              body
              properties]))
-        result (with-pre-block-if-exists blocks body pre-block-properties encoded-content options)]
+        result (with-pre-block-if-exists blocks body pre-block-properties encoded-content (assoc options :format format))]
     (map #(dissoc % :block/meta) result)))
 
 (defn with-parent-and-order
@@ -836,66 +859,50 @@
                                (fn [b]
                                  (not= "macro" (:block/type b)))
                                blocks)
-        result (loop [blocks (map (fn [block] (assoc block :block/level-spaces (:block/level block))) blocks)
-                      parents [{:page/id page-id     ; db id or a map {:block/name "xxx"}
-                                :block/level 0
-                                :block/level-spaces 0}]
+        result (loop [remaining-blocks blocks
+                      frames [{:ref page-id :level 0 :indent 0}]
                       result []]
-                 (if (empty? blocks)
-                   (map #(dissoc % :block/level-spaces) result)
-                   (let [[block & others] blocks
-                         level-spaces (:block/level-spaces block)
-                         {uuid' :block/uuid :block/keys [level parent] :as last-parent} (last parents)
-                         parent-spaces (:block/level-spaces last-parent)
-                         [blocks parents result]
+                 (if (empty? remaining-blocks)
+                   result
+                   (let [[block & others] remaining-blocks
+                         input-level (:block/level block)
+                         [ancestor-frames last-popped-frame]
+                         (loop [stack frames
+                                last-popped-frame nil]
+                           (let [top-frame (peek stack)]
+                             (if (< input-level (:indent top-frame))
+                               (recur (pop stack) top-frame)
+                               [stack last-popped-frame])))
+                         {:keys [level parent indent] :as top-frame} (peek ancestor-frames)
+                         [resolved-block base-frames comparison-indent]
                          (cond
-                           (= level-spaces parent-spaces)        ; sibling
-                           (let [block (assoc block
-                                              :block/parent parent
-                                              :block/level level)
-                                 parents' (conj (vec (butlast parents)) block)
-                                 result' (conj result block)]
-                             [others parents' result'])
+                           (= input-level indent)               ; sibling
+                           [(assoc block :block/parent parent :block/level level)
+                            (pop ancestor-frames)
+                            input-level]
 
-                           (> level-spaces parent-spaces)         ; child
-                           (let [parent (if uuid' [:block/uuid uuid'] (:page/id last-parent))
-                                 block (cond->
-                                        (assoc block
-                                               :block/parent parent)
-                                         ;; fix block levels with wrong order
-                                         ;; For example:
-                                         ;;   - a
-                                         ;; - b
-                                         ;; What if the input indentation is two spaces instead of 4 spaces
-                                         (>= (- level-spaces parent-spaces) 1)
-                                         (assoc :block/level (inc level)))
-                                 parents' (conj parents block)
-                                 result' (conj result block)]
-                             [others parents' result'])
+                           (nil? last-popped-frame)              ; child
+                           [(cond-> (assoc block :block/parent (:ref top-frame))
+                              ;; A jump in input indentation adds one tree level.
+                              (>= (- input-level indent) 1)
+                              (assoc :block/level (inc level)))
+                            ancestor-frames
+                            input-level]
 
-                           (< level-spaces parent-spaces)
-                           (cond
-                             (some #(= (:block/level-spaces %) (:block/level-spaces block)) parents) ; outdent
-                             (let [parents' (vec (filter (fn [p] (<= (:block/level-spaces p) level-spaces)) parents))
-                                   blocks (cons (assoc (first blocks)
-                                                       :block/level (dec level))
-                                                (rest blocks))]
-                               [blocks parents' result])
-
-                             :else
-                             (let [[f r] (split-with (fn [p] (<= (:block/level-spaces p) level-spaces)) parents)
-                                   left (first r)
-                                   parent-id (if-let [block-id (:block/uuid (last f))]
-                                               [:block/uuid block-id]
-                                               page-id)
-                                   block (assoc block
-                                                :block/parent parent-id
-                                                :block/level (:block/level left)
-                                                :block/level-spaces (:block/level-spaces left))
-
-                                   parents' (->> (concat f [block]) vec)
-                                   result' (conj result block)]
-                               [others parents' result'])))]
-                     (recur blocks parents result))))
+                           :else                                ; irregular outdent
+                           ;; Reuse the nearest removed indentation slot for later siblings.
+                           [(assoc block
+                                   :block/parent (or (:ref top-frame) page-id)
+                                   :block/level (:level last-popped-frame))
+                            ancestor-frames
+                            (:indent last-popped-frame)])
+                         frame {:ref (when-let [block-uuid (:block/uuid resolved-block)]
+                                       [:block/uuid block-uuid])
+                                :parent (:block/parent resolved-block)
+                                :level (:block/level resolved-block)
+                                :indent comparison-indent}]
+                     (recur others
+                            (conj base-frames frame)
+                            (conj result resolved-block)))))
         result' (map (fn [block] (assoc block :block/order (db-order/gen-key))) result)]
     (concat result' other-blocks)))

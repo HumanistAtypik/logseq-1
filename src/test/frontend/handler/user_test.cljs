@@ -2,6 +2,7 @@
   (:require [cljs.core.async :as a]
             [cljs.test :refer [async deftest is testing]]
             [electron.ipc :as ipc]
+            [frontend.config :as config]
             [frontend.handler.user :as user-handler]
             [frontend.state :as state]
             [frontend.util :as util]
@@ -134,7 +135,8 @@
 (deftest logout-clears-e2ee-password-when-db-worker-ready-test
   (testing "logout should request db-worker to clear persisted e2ee password"
     (let [ops* (atom [])
-          old-worker @state/*db-worker]
+          old-worker @state/*db-worker
+          old-login-user (:auth/current-login-user (state/get-state))]
       (reset! state/*db-worker :worker)
       (try
         (with-mocked-local-storage
@@ -149,12 +151,22 @@
               (is (= :thread-api/clear-e2ee-password
                      (first @ops*))))))
         (finally
+          (state/set-state! :auth/current-login-user old-login-user)
           (reset! state/*db-worker old-worker))))))
+
+(deftest can-list-remote-graphs-uses-default-server-test
+  (with-redefs [config/dev? false
+                config/get-custom-sync-server-url (constantly nil)
+                state/user-groups (constantly #{})
+                user-handler/logged-in? (constantly true)]
+    (is (false? (user-handler/rtc-group?)))
+    (is (true? (user-handler/can-list-remote-graphs?)))))
 
 (deftest logout-skips-e2ee-password-clear-when-db-worker-missing-test
   (testing "logout should not call db-worker API when db-worker is unavailable"
     (let [invoke-calls* (atom 0)
-          old-worker @state/*db-worker]
+          old-worker @state/*db-worker
+          old-login-user (:auth/current-login-user (state/get-state))]
       (reset! state/*db-worker nil)
       (try
         (with-mocked-local-storage
@@ -168,4 +180,5 @@
               (user-handler/logout)
               (is (zero? @invoke-calls*)))))
         (finally
+          (state/set-state! :auth/current-login-user old-login-user)
           (reset! state/*db-worker old-worker))))))

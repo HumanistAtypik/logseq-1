@@ -227,6 +227,13 @@ input[type='range'] {
     transition: opacity 200ms ease-in-out, transform 200ms ease-in-out;
   }
 
+  /* Keep wide tables within their grid track without clipping the scrollbar.
+     Collapsed foldables retain hidden overflow for the 0fr animation. */
+  &:not(.is-collapsed):has(.ls-table-rows) > .ls-foldable-content-inner {
+    min-width: 0;
+    overflow: visible;
+  }
+
   &.is-collapsed {
     grid-template-rows: 0fr;
 
@@ -239,6 +246,18 @@ input[type='range'] {
 
 .ls-nlp-calendar {
   @apply flex flex-col gap-2 relative;
+}
+
+.ls-date-year-input,
+.ls-repeat-frequency-input {
+  appearance: textfield;
+  -moz-appearance: textfield;
+
+  &::-webkit-inner-spin-button,
+  &::-webkit-outer-spin-button {
+    appearance: none;
+    margin: 0;
+  }
 }
 
 .ls-editor-date-picker {

@@ -30,30 +30,36 @@
 
 (defonce asset-protocol "assets://")
 
+(def local-file-asset-prefix "assets://localhost/logseq__file")
+
 (defonce db-version-prefix "logseq_db_")
 (defonce file-version-prefix "logseq_local_")
 
 (defn strip-leading-db-version-prefix
-  "Strip exactly one leading db prefix for user-facing display values."
+  "Trim `s` and strip exactly one leading db prefix for display values."
   [s]
-  (if (and (string? s)
-           (string/starts-with? s db-version-prefix))
-    (subs s (count db-version-prefix))
+  (if (string? s)
+    (let [trimmed (string/trim s)]
+      (string/trim
+       (if (string/starts-with? trimmed db-version-prefix)
+         (subs trimmed (count db-version-prefix))
+         trimmed)))
     s))
 
 (defn canonicalize-db-version-repo
-  "Normalize any repo/graph name to exactly one leading db prefix."
+  "Trim a repo/graph name and normalize it to exactly one leading db prefix."
   [s]
-  (when (seq s)
-    (let [s (str s)
-          stripped (loop [name' s]
-                     (if (string/starts-with? name' db-version-prefix)
-                       (recur (subs name' (count db-version-prefix)))
-                       name'))]
-      (str db-version-prefix stripped))))
+  (when-let [trimmed (some-> s str string/trim not-empty)]
+    (let [stripped (loop [graph-name trimmed]
+                     (if (string/starts-with? graph-name db-version-prefix)
+                       (recur (string/trim (subs graph-name (count db-version-prefix))))
+                       graph-name))]
+      (when (seq stripped)
+        (str db-version-prefix stripped)))))
 
 (defonce default-graphs-dir "~/logseq/graphs")
 (defonce local-assets-dir "assets")
+(def max-asset-size (* 200 1024 1024))
 (defonce unlinked-graphs-dir "Unlinked graphs")
 
 (defonce favorites-page-name "$$$favorites")
@@ -95,7 +101,7 @@
 
 (defn img-formats
   []
-  #{:gif :svg :jpeg :ico :png :jpg :bmp :webp :avif :cr2})
+  #{:gif :svg :jpeg :ico :png :jpg :bmp :webp :avif :cr2 :jxl})
 
 (defonce block-pattern "-")
 

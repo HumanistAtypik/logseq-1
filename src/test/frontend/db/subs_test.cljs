@@ -4,12 +4,35 @@
             [frontend.db.subs :as subs]
             [frontend.state :as state]
             [frontend.worker.db-listener :as db-listener]
+            [frontend.worker.handler.block :as block-handler]
+            [frontend.worker.render-delta :as render-delta]
             [frontend.worker.handler.render-resource.engine :as render-engine]
             [logseq.db :as ldb]
             [logseq.db.test.helper :as db-test]
-            [promesa.core :as p]))
+            [promesa.core :as p]
+            [cljs.cache :as cache]
+            [frontend.common.cache :as common-cache]))
 
 (def ^:private test-graph-id "subs-test-graph")
+
+(deftest empty-lru-evicts-as-the-factory-cache-test
+  ;; the warm block cache and the parse cache are built empty (no 20000 / 5000
+  ;; placeholder entries); they must hold, hit and evict exactly as
+  ;; lru-cache-factory's cache of that size
+  (let [limit 5
+        ops (concat (map (fn [i] [:miss i]) (range 8))
+                    [[:hit 4] [:miss 9] [:evict 6] [:miss 10] [:miss 4] [:miss 11]])
+        run (fn [c] (reduce (fn [c [op k]]
+                              (case op
+                                :miss (cache/miss c k (str "v" k))
+                                :hit (cache/hit c k)
+                                :evict (cache/evict c k)))
+                            c ops))
+        factory (run (cache/lru-cache-factory {} :threshold limit))
+        lean (run (common-cache/empty-lru limit))]
+    (is (= (into {} (seq factory)) (into {} (seq lean))))
+    (is (= limit (count lean)))
+    (is (some? (#'subs/empty-warm-cache)))))
 
 (defn- block
   ([block-uuid tx-id title]
@@ -150,6 +173,30 @@
                      (unsubscribe!))
                    (reset! state/*db-worker previous-db-worker)))))))))
 
+(deftest children-of-a-parent-that-is-gone-are-missing-not-an-error-test
+  ;; Key fuzzer: Enter, then Ctrl+Z (or Down, Ctrl+Z) with no wait undid the inserted block while its children
+  ;; slot was loading; the worker's "Missing direct-children parent" became an :error snapshot, which the
+  ;; hooks throw in render, and the app showed "Something went wrong".
+  (async done
+         (let [parent-uuid (random-uuid)
+               other-uuid (random-uuid)]
+           (finish-async!
+            done
+            (p/with-redefs [subs/<load-children
+                            (fn [_graph-id requested-uuid]
+                              (p/rejected (js/Error. (if (= requested-uuid parent-uuid)
+                                                       "Missing direct-children parent"
+                                                       "temporary worker failure"))))]
+              (let [unsubscribe (subs/subscribe-children! parent-uuid (fn []))
+                    unsubscribe-other (subs/subscribe-children! other-uuid (fn []))]
+                (p/let [_ (p/delay 0)]
+                  (is (= :missing (:status (subs/children-snapshot parent-uuid)))
+                      "children of a parent that is gone render as missing")
+                  (is (= :error (:status (subs/children-snapshot other-uuid)))
+                      "any other failed read stays an error")
+                  (unsubscribe)
+                  (unsubscribe-other))))))))
+
 (deftest mounted-error-snapshot-retries-when-worker-recovers-test
   (async done
          (let [resource-key [:journals]
@@ -228,6 +275,51 @@
                 (fn []
                   (when-let [unsubscribe! @unsubscribe]
                     (unsubscribe!)))))))))
+
+(deftest orderless-children-roundtrip-through-snapshots-and-deltas-test
+  (async done
+         (let [conn (db-test/create-conn)
+               parent-uuid (random-uuid)
+               child-uuid (random-uuid)]
+           (d/transact! conn [{:db/id -1
+                              :block/uuid parent-uuid
+                              :block/tx-id 1
+                              :block/title "Parent"
+                              :block/name "parent"
+                              :block/tags :logseq.class/Page}
+                             {:block/uuid child-uuid
+                              :block/tx-id 1
+                              :block/title "Child"
+                              :block/name "child"
+                              :block/tags :logseq.class/Page
+                              :block/parent -1}])
+           (finish-async!
+            done
+            (p/with-redefs [subs/<load-children
+                            (fn [_graph-id requested-parent]
+                              (let [{:keys [basis-rev parent-tx-id items]}
+                                    (block-handler/direct-children-membership @conn requested-parent)]
+                                (p/resolved (children-patch basis-rev requested-parent parent-tx-id items))))]
+              (let [unsubscribe (subs/subscribe-children! parent-uuid (fn []))]
+                (->
+                 (p/let [_ (p/delay 0)
+                         _ (is (= {:status :ready :value [child-uuid]}
+                                  (subs/children-snapshot parent-uuid)))]
+                   (doseq [[tx-data expected]
+                           [[[[:db/add [:block/uuid parent-uuid] :logseq.property/deleted-at 1000]] []]
+                            [[[:db/retract [:block/uuid parent-uuid] :logseq.property/deleted-at 1000]] [child-uuid]]]]
+                     (let [report (d/transact! conn tx-data)
+                           commit (render-delta/build
+                                   {:graph-id test-graph-id
+                                    :rev (:max-tx (:db-after report))
+                                    :blocks {}
+                                    :deleted-block-uuids #{}
+                                    :affected-keys #{}
+                                    :tx-report report})]
+                       (subs/apply-delta! (-> commit ldb/write-transit-str ldb/read-transit-str))
+                       (is (= {:status :ready :value expected}
+                              (subs/children-snapshot parent-uuid))))))
+                 (p/finally unsubscribe))))))))
 
 (deftest block-changed-uses-only-tx-id-test
   (let [block-uuid (random-uuid)
@@ -2040,3 +2132,128 @@
                               "An unrelated newer graph revision does not stale the result.")]
                   (is (= 1 @calls))
                   (unsubscribe))))))))
+
+(deftest positioned-property-metadata-refreshes-mounted-and-warm-blocks-test
+  (async done
+         (let [mounted-uuid (random-uuid)
+               warm-uuid (random-uuid)
+               property-uuid (random-uuid)
+               calls (atom [])
+               revision (atom 1)
+               position (atom :block-left)
+               title (atom "Status")
+               row (fn [id]
+                     (block id 1 "Task"
+                            {:block.temp/positioned-properties
+                             {@position [{:block/uuid property-uuid :block/title @title}]}}))]
+           (finish-async! done
+                          (p/with-redefs [subs/<load-block
+                                          (fn [_ id]
+                                            (swap! calls conj id)
+                                            (p/resolved (block-patch @revision {id (row id)})))]
+                            (let [unsub-mounted (subs/subscribe-block! mounted-uuid (fn []))
+                                  unsub-warm (subs/subscribe-block! warm-uuid (fn []))]
+                              (p/let [_ (p/delay 0)
+                                      _ (unsub-warm)
+                                      _ (p/delay 0)
+                                      _ (reset! revision 2)
+                                      _ (reset! position :block-right)
+                                      _ (subs/apply-delta! (delta 2 {:affected-keys #{[:property-config]}}))
+                                      _ (p/delay 0)]
+                                (is (= 2 (count (filter #{mounted-uuid} @calls))))
+                                (is (= 1 (count (filter #{warm-uuid} @calls))) "Unmounted rows are invalidated without fetching.")
+                                (is (seq (get-in (subs/block-snapshot mounted-uuid)
+                                                 [:value :block.temp/positioned-properties :block-right])))
+                                (let [unsub-warm-again (subs/subscribe-block! warm-uuid (fn []))]
+                                  (p/let [_ (p/delay 0)
+                                          _ (is (= 2 (count (filter #{warm-uuid} @calls))))
+                                          _ (reset! revision 3)
+                                          _ (reset! title "Renamed")
+                                          _ (subs/apply-delta! (delta 3 {:affected-keys #{[:entity property-uuid]}}))
+                                          _ (p/delay 0)]
+                                    (is (= "Renamed" (get-in (subs/block-snapshot mounted-uuid)
+                                                             [:value :block.temp/positioned-properties :block-right 0 :block/title])))
+                                    (unsub-mounted)
+                                    (unsub-warm-again))))))))))
+
+(deftest property-change-during-block-load-rejects-old-projection-test
+  (async done
+         (let [id (random-uuid)
+               property-uuid (random-uuid)
+               pending (p/deferred)
+               calls (atom 0)
+               row (fn [title] (block id 1 "Task"
+                                      {:block.temp/positioned-properties
+                                       {:block-left [{:block/uuid property-uuid :block/title title}]}}))]
+           (finish-async! done
+                          (p/with-redefs [subs/<load-block
+                                          (fn [_ _]
+                                            (if (= 1 (swap! calls inc)) pending
+                                                (p/resolved (block-patch 2 {id (row "New")}))))]
+                            (let [unsubscribe (subs/subscribe-block! id (fn []))]
+                              (p/let [_ (subs/apply-delta! (delta 2 {:affected-keys #{[:entity property-uuid]}}))
+                                      _ (p/resolve! pending (block-patch 1 {id (row "Old")}))
+                                      _ (p/delay 0)
+                                      _ (p/delay 0)]
+                                (is (= 2 @calls))
+                                (is (= "New" (get-in (subs/block-snapshot id)
+                                                     [:value :block.temp/positioned-properties :block-left 0 :block/title])))
+                                (unsubscribe))))))))
+
+(deftest property-change-during-children-load-rejects-old-hydrated-projection-test
+  (async done
+         (let [parent-id (random-uuid)
+               id (random-uuid)
+               property-uuid (random-uuid)
+               pending (p/deferred)
+               calls (atom 0)
+               patch (fn [rev title]
+                       (subtree-patch
+                        rev {id (block id 1 "Task"
+                                       {:block.temp/positioned-properties
+                                        {:block-left [{:block/uuid property-uuid :block/title title}]}})}
+                        {parent-id {:parent-tx-id 1 :items [[id "a"]]}}))]
+           (finish-async! done
+                          (p/with-redefs [subs/<load-children
+                                          (fn [_ _]
+                                            (if (= 1 (swap! calls inc)) pending
+                                                (p/resolved (patch 2 "New"))))]
+                            (let [unsubscribe (subs/subscribe-children! parent-id (fn []))]
+                              (p/let [_ (subs/apply-delta! (delta 2 {:affected-keys #{[:property-config]}}))
+                                      _ (p/resolve! pending (patch 1 "Old"))
+                                      _ (p/delay 0)
+                                      _ (p/delay 0)]
+                                (is (= 2 @calls))
+                                (is (= "New" (get-in (subs/block-snapshot id)
+                                                     [:value :block.temp/positioned-properties :block-left 0 :block/title])))
+                                (unsubscribe))))))))
+
+(deftest property-change-during-resource-load-rejects-old-hydrated-projection-test
+  (async done
+         (let [resource-key [:test-hydrated-properties]
+               id (random-uuid)
+               property-uuid (random-uuid)
+               pending (p/deferred)
+               calls (atom 0)
+               patch (fn [rev title]
+                       (update (exact-resource-patch rev resource-key #{} [id])
+                               :slots merge
+                               (:slots (block-patch
+                                        rev {id (block id 1 "Task"
+                                                       {:block.temp/positioned-properties
+                                                        {:block-left [{:block/uuid property-uuid
+                                                                       :block/title title}]}})}))))]
+           (finish-async! done
+                          (p/with-redefs [subs/<load-resource
+                                          (fn [_ _]
+                                            (if (= 1 (swap! calls inc)) pending
+                                                (p/resolved (patch 2 "New"))))]
+                            (let [unsubscribe (subs/subscribe-resource! resource-key (fn []))]
+                              (p/let [_ (subs/apply-delta! (delta 2 {:affected-keys #{[:property-config]}}))
+                                      _ (p/resolve! pending (patch 1 "Old"))
+                                      _ (p/delay 0)
+                                      _ (p/delay 0)]
+                                (is (= 2 @calls))
+                                (is (= "New" (get-in (subs/block-snapshot id)
+                                                     [:value :block.temp/positioned-properties :block-left 0 :block/title])))
+                                (unsubscribe))))))))

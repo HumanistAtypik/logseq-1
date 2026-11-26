@@ -84,8 +84,29 @@
 
 (defonce textarea-autosize (gobj/get TextareaAutosize "default"))
 
-(hsx/defc textarea [opts & children]
-  (into [:> textarea-autosize opts] children))
+(defonce ^:private field-sizing-supported?
+  (boolean
+   (and (exists? js/CSS)
+        (.supports js/CSS "field-sizing" "content"))))
+
+(hsx/defc textarea
+  "A textarea whose height follows its content. Where the browser supports the
+   CSS `field-sizing: content` (Chromium 123, Safari 26.2, Firefox 152) this is
+   a plain textarea and no JavaScript measures it on any keystroke; `:minRows`
+   becomes a `min-height` in line-height units. Elsewhere it is the
+   react-textarea-autosize component as before, with its `:cacheMeasurements`
+   prop passed through."
+  [{:keys [minRows] :as opts} & children]
+  (if field-sizing-supported?
+    (let [opts (-> opts
+                   (dissoc :minRows :maxRows :cacheMeasurements :onHeightChange)
+                   ;; `rows` has no effect under field-sizing: content, so the
+                   ;; minimum is a min-height in line-height units.
+                   (update :style assoc
+                           :field-sizing "content"
+                           :min-height (str (or minRows 1) "lh")))]
+      (into [:textarea opts] children))
+    (into [:> textarea-autosize opts] children)))
 
 (hsx/defc virtualized-list [opts & children]
   (into [:> Virtuoso opts] children))
@@ -309,10 +330,21 @@
      (when shortcut
        [:span.ml-1 (render-keyboard-shortcut shortcut)])]))
 
+(defn- checkbox-root-checked?
+  "Base UI Checkbox uses aria-checked and data-checked. The inputless span
+  also sets data-state. Clicks can land on the inner indicator, so callers
+  must pass the checkbox root (currentTarget)."
+  [^js el]
+  (or (= "true" (.getAttribute el "aria-checked"))
+      (.hasAttribute el "data-checked")
+      (= "checked" (.-state (.-dataset el)))))
+
 (defn checkbox
   [option]
   (let [on-change' (:on-change option)
         on-click' (:on-click option)
+        controlled-checked (when (contains? option :checked)
+                             (true? (:checked option)))
         option (cond-> (dissoc option :on-change :on-click)
                  (and on-click' (nil? on-change'))
                  (assoc :data-inputless true)
@@ -321,9 +353,15 @@
                  (assoc :on-click
                         (fn [^js e]
                           (some-> on-click' (apply [e]))
-                          (let [checked? (= (.-state (.-dataset (.-target e))) "checked")]
-                            (set! (. (.-target e) -checked) (not checked?))
-                            (some-> on-change' (apply [e]))))))]
+                          (when-let [el (.-currentTarget e)]
+                            (let [checked? (if (some? controlled-checked)
+                                             controlled-checked
+                                             (checkbox-root-checked? el))
+                                  next-checked? (not checked?)]
+                              (set! (.-checked el) next-checked?)
+                              (when-let [target (.-target e)]
+                                (set! (.-checked target) next-checked?))
+                              (some-> on-change' (apply [e])))))))]
     (shui/checkbox
      (merge option
             {:disabled (or (:disabled option) config/publishing?)}))))
@@ -446,13 +484,16 @@
            header
            grouped?]
     :as opts}]
-  (let [*current-idx (hooks/use-memo #(atom 0) [])
+  (let [matched (if get-group-name
+                  (let [items-by-group (group-by get-group-name matched)]
+                    (into [] (mapcat items-by-group) (distinct (map get-group-name matched))))
+                  matched)
+        *current-idx (hooks/use-memo #(atom 0) [])
         [current-idx] (hooks/use-atom *current-idx)
         shortcut-state {:matched matched
                         :opts opts
                         ::current-idx *current-idx}
         _ (shortcut/use-shortcut-handler! :shortcut.handler/auto-complete shortcut-state)
-        *groups (atom #{})
         render-f (fn [matched]
                    (for [[idx item] matched]
                      (let [react-key (str idx)
@@ -462,33 +503,34 @@
                                        (if (and (gobj/get e "shiftKey") on-shift-chosen)
                                          (on-shift-chosen item)
                                          (on-chosen item e))))
-                           item-cp
-                           [:div.menu-link-wrap
-                            {:key react-key
-                             ;; mouse-move event to indicate that cursor moved by user
-                             :on-mouse-move  #(reset! *current-idx idx)
-                             :on-click choose!}
-                            (let [chosen? (= current-idx idx)]
-                              (menu-link
-                               {:id (str "ac-" react-key)
-                                :tab-index "0"
-                                :class (when chosen? "chosen")
-                                :on-mouse-down util/stop
-                                :on-click choose!}
-                               (if item-render (item-render item chosen?) item)))]
-                           group-name (and (fn? get-group-name) (get-group-name item))]
-                       (if (and group-name (not (contains? @*groups group-name)))
-                         (do
-                           (swap! *groups conj group-name)
-                           [:div
-                            [:div.ui__ac-group-name group-name]
-                            item-cp])
-                         item-cp))))]
+                           chosen? (= current-idx idx)]
+                       [:div.menu-link-wrap
+                        {:key react-key
+                         ;; mouse-move event to indicate that cursor moved by user
+                         :on-mouse-move #(reset! *current-idx idx)
+                         :on-click choose!}
+                        (menu-link
+                         {:id (str "ac-" react-key)
+                          :tab-index "0"
+                          :class (when chosen? "chosen")
+                          :on-mouse-down util/stop
+                          :on-click choose!}
+                         (if item-render (item-render item chosen?) item))])))]
     [:div#ui__ac {:class class}
      (if (seq matched)
        [:div#ui__ac-inner.hide-scrollbar
         (when header header)
-        (if grouped?
+        (cond
+          get-group-name
+          (for [items (partition-by (comp get-group-name second) (medley/indexed matched))
+                :let [[idx item] (first items)]]
+            [:div {:key idx}
+             (if-let [group-name (get-group-name item)]
+               [:div.ui__ac-group-name group-name]
+               (when (pos? idx) [:hr]))
+             (render-f items)])
+
+          grouped?
           (let [*idx (atom -1)
                 inc-idx #(swap! *idx inc)]
             (for [[group matched] (group-by :group matched)]
@@ -498,6 +540,7 @@
                    [:div.ui__ac-group-name group]
                    (render-f matched')]
                   (render-f matched')))))
+          :else
           (render-f (medley/indexed matched)))]
        (when empty-placeholder
          empty-placeholder))]))
@@ -956,10 +999,41 @@
                     (shui/tooltip-content content-props tooltip-content))
                    (shui/tooltip-content content-props tooltip-content)))))
 
+(def ^:private date-picker-root-selector
+  ".ls-editor-date-picker, .ls-property-date-picker")
+
+(def ^:private date-picker-form-control-selector
+  "input, textarea, select, [contenteditable='true']")
+
+(defn date-picker-form-target?
+  "True when Enter should stay in a date-picker form control instead of confirming the date."
+  [^js e]
+  (let [target (.-target e)]
+    (boolean
+     (and target
+          (.closest target date-picker-root-selector)
+          (or (.closest target date-picker-form-control-selector)
+              (some-> target
+                      (.closest "[role='combobox']")
+                      (.getAttribute "aria-expanded")
+                      (= "true"))
+              (and (.closest target "button")
+                   (not (.closest target "[role='gridcell']"))))))))
+
 (hsx/defc DelDateButton
   [on-delete]
-  (shui/button {:variant :outline :size :sm :class "del-date-btn" :on-click on-delete}
-               (shui/tabler-icon "trash" {:size 15})))
+  (shui/button {:variant :outline
+                :class "del-date-btn h-8 w-9 bg-transparent !p-0 !px-0 !py-0 opacity-80 hover:opacity-100"
+                :on-click on-delete}
+               (shui/tabler-icon "trash" {:size 16})))
+
+(defn- next-month-button-with-del
+  "The next-month nav button followed by the delete button, both compact items
+   in the calendar's nav row."
+  [^js props on-delete]
+  (react/createElement react/Fragment nil
+                       (react/createElement "button" props)
+                       (DelDateButton on-delete)))
 
 (defonce month-values
   [:January :February :March :April :May
@@ -1005,7 +1079,7 @@
          :on-blur (fn [_]
                     (when-not (re-matches #"\d{4}" year-value)
                       (set-year-value! (str value))))
-         :class "h-8 ml-2 !w-[5.75rem] !px-3 !py-0"
+         :class "ls-date-year-input h-8 !w-[3.25rem] !px-2 !py-0"
          :value year-value
          :type "number"
          :min 1
@@ -1015,14 +1089,15 @@
                 (shui/dropdown-menu-trigger
                  {:as-child true}
                  (shui/button {:variant :ghost
-                               :class "!px-3 !py-0 h-8 !w-24 justify-start border border-input rounded-md"
+                               :class "ls-date-month-select !px-3 !py-0 h-8 !w-24 justify-start border border-input rounded-md"
                                :size :sm}
                               (get-month-label value)))
         (shui/dropdown-menu-content
          (for [[idx _month] (medley/indexed month-values)
                :let [label (get-month-label idx)]]
-           (shui/dropdown-menu-checkbox-item
-            {:checked (= value idx)
+           (shui/dropdown-menu-item
+            {:key idx
+             :class "ls-date-month-option"
              :on-select (fn []
                           (onChange (day-picker-change-event idx)))}
             label)))))]))
@@ -1039,8 +1114,11 @@
      :formatters {:formatWeekdayName (fn [weekday _]
                                        (i18n/locale-format-date weekday {:weekday "short"}))}
      :components (cond-> {:Dropdown #(date-year-month-select (bean/bean %))}
-                   del-btn? (assoc :Head #(DelDateButton on-delete)))
-     :class-names {:root (when del-btn? "has-del-btn")}
+                   del-btn? (assoc :NextMonthButton #(next-month-button-with-del % on-delete)))
+     :class-names (when del-btn?
+                    ;; three h-8 w-9 nav buttons + gap-1 need 116px inside the 276px caption
+                    {:root "has-del-btn"
+                     :nav "absolute left-[160px] top-1 z-10 flex items-center gap-1"})
      :on-day-key-down (fn [^js d _ ^js e]
                         (when (= "Enter" (.-key e))
                           (let [on-select' (or on-select on-day-click)]

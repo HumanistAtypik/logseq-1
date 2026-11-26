@@ -3,12 +3,16 @@
             [clojure.test :refer [deftest is use-fixtures]]
             [logseq.e2e.api :refer [ls-api-call!]]
             [logseq.e2e.assert :as assert]
+            [logseq.e2e.block :as b]
             [logseq.e2e.fixtures :as fixtures]
             [logseq.e2e.keyboard :as k]
             [logseq.e2e.locator :as loc]
             [logseq.e2e.page :as page]
             [logseq.e2e.util :as util]
-            [wally.main :as w]))
+            [wally.main :as w])
+  (:import (com.microsoft.playwright Locator$ClickOptions)
+           (com.microsoft.playwright.options FilePayload)
+           (java.nio.charset StandardCharsets)))
 
 (use-fixtures :once fixtures/open-page)
 
@@ -51,6 +55,20 @@
     (assert/assert-is-visible
      (loc/filter ".ls-view-body .ls-table-row" :has-text "Beta table object"))))
 
+(defn- regex-quote
+  "Escapes regex metacharacters with JS-compatible syntax (\\Q...\\E is Java-only)."
+  [s]
+  (string/replace s #"[-/^$*+?.()|\[\]{}\\]" "\\\\$0"))
+
+(defn- assert-body-text-order
+  "Waits until `before` precedes `after` in the view body text."
+  [before after]
+  (-> (.locator (w/get-page) ".ls-view-body")
+      assert/assert-that
+      (.hasText (re-pattern (str (regex-quote before)
+                                 "[\\s\\S]*"
+                                 (regex-quote after))))))
+
 (defn- view-action-button
   [icon]
   (.first (.locator (w/get-page)
@@ -80,6 +98,23 @@
   (assert/assert-is-visible ".ls-table-actions")
   (assert/assert-is-visible
    (loc/filter ".ls-table-actions .selection-count" :has-text "2")))
+
+(deftest all-pages-delete-confirm-stays-open-on-pointer-release-test
+  (let [page-name (page/get-page-name)
+        click-opts (doto (Locator$ClickOptions.)
+                     (.setDelay 120))]
+    (util/search-and-click "Go to all pages")
+    (assert/assert-is-visible ".ls-all-pages")
+    (let [row (loc/filter ".ls-view-body .ls-table-row" :has-text page-name)]
+      (w/click (.locator row "[data-table-row-select]")))
+    (assert/assert-is-visible ".ls-table-actions")
+    (let [trash (.first (.locator (w/get-page)
+                                  ".ls-table-actions button:has(.ls-icon-trash)"))]
+      (.click trash click-opts))
+    (assert/assert-is-visible ".ui__dialog-content")
+    (assert/assert-is-visible "#modal-headline")
+    (w/click (loc/filter ".ui__dialog-content button" :has-text "Cancel"))
+    (assert/assert-is-hidden ".ui__dialog-content")))
 
 (deftest view-lifecycle-and-display-type-persistence-test
   (let [tag-name "view-lifecycle"
@@ -130,6 +165,26 @@
      0)
     (assert/assert-is-visible
      (loc/filter ".views > button" :has-text "All"))))
+
+(deftest table-search-keeps-focus-through-debounced-refresh-test
+  (seed-table-view! "table-search-focus")
+  (w/click (view-action-button "search"))
+  (let [input (.locator (w/get-page) ".view-action-search input")
+        original-input (.elementHandle input)]
+    (try
+      (w/fill input "Alpha")
+      ;; Result changes wait for both the debounce and the worker response.
+      (assert/assert-have-count
+       (loc/filter ".ls-view-body .ls-table-row" :has-text "Beta table object")
+       0)
+      (assert/assert-is-visible
+       (loc/filter ".ls-view-body .ls-table-row" :has-text "Alpha table object"))
+      (is (.evaluate original-input "input => input === document.activeElement")
+          "The original input still has focus after the search results refresh")
+      (util/press-seq " table")
+      (-> input assert/assert-that (.hasValue "Alpha table"))
+      (finally
+        (.dispose original-input)))))
 
 (deftest table-view-search-filter-and-new-record-actions-test
   (seed-table-view! "table-search-filter-actions")
@@ -216,9 +271,7 @@
   (open-view-submenu! "Sort groups order")
   (w/click (loc/filter "[role='menuitemcheckbox']" :has-text "Descending"))
   (util/double-esc)
-  (let [body-text (.innerText (.locator (w/get-page) ".ls-view-body"))]
-    (is (< (string/index-of body-text "Open")
-           (string/index-of body-text "Closed"))))
+  (assert-body-text-order "Open" "Closed")
 
   (open-view-more-actions!)
   (w/click (.last (loc/filter "[role='menuitem']" :has-text "Export EDN")))
@@ -227,3 +280,73 @@
   (let [content (w/eval-js "navigator.clipboard.readText()")]
     (is (string/includes? content "Alpha table object"))
     (is (string/includes? content "Beta table object"))))
+
+(defn- sort-table-column!
+  [column-name direction]
+  (w/click (loc/filter ".ls-view-body .ls-table-header-cell" :has-text column-name))
+  (w/click (loc/filter "[role='menuitem']" :has-text direction))
+  (assert/assert-is-visible
+   (loc/filter ".ls-view-body .ls-table-row" :has-text "Alpha table object")))
+
+(deftest table-view-column-sort-does-not-crash-test
+  (seed-table-view! "table-column-sort")
+  (sort-table-column! "Name" "Sort ascending")
+  (assert-body-text-order "Alpha table object" "Beta table object")
+  (sort-table-column! "Priority" "Sort ascending")
+  (assert-body-text-order "Beta table object" "Alpha table object")
+  (sort-table-column! "Created At" "Sort descending")
+  (assert/assert-is-visible
+   (loc/filter ".ls-view-body .ls-table-row" :has-text "Alpha table object"))
+  (assert/assert-is-visible
+   (loc/filter ".ls-view-body .ls-table-row" :has-text "Beta table object")))
+
+(defn- upload-asset!
+  [title extension mime-type content]
+  (let [chooser (.waitForFileChooser (w/get-page)
+                                    #(util/input-command "Upload an asset"))]
+    (.setFiles chooser (FilePayload. (str title "." extension) mime-type content))
+    (assert/assert-is-visible
+     (loc/filter ".ls-page-blocks .ls-block .block-content" :has-text title))))
+
+(defn- goto-asset-tag-page!
+  []
+  (let [asset-tag (ls-api-call! :editor.getTag "logseq.class/Asset")]
+    (ls-api-call! :app.pushState
+                  "page"
+                  {"name" (get asset-tag "uuid")}
+                  nil)))
+
+(deftest table-view-raw-number-zero-filter-does-not-crash-test
+  (let [zero-name "Empty document"
+        five-name "Sample document"]
+    (b/new-block "Assets")
+    (upload-asset! zero-name "pdf" "application/pdf" (byte-array 0))
+    (upload-asset! five-name "txt" "text/plain" (.getBytes "hello" StandardCharsets/UTF_8))
+    (util/double-esc)
+    (goto-asset-tag-page!)
+    (assert/assert-is-visible ".ls-view-body .ls-table-header-cell")
+    (assert/assert-is-visible
+     (loc/filter ".ls-view-body .ls-table-row" :has-text zero-name))
+    (assert/assert-is-visible
+     (loc/filter ".ls-view-body .ls-table-row" :has-text five-name))
+
+    (w/click (view-action-button "filter"))
+    (w/click (loc/filter ".cp__select-results a" :has-text "File Size"))
+    (assert/assert-is-visible (util/get-by-text "0" true))
+    (w/click (.last (util/get-by-text "0" true)))
+    (util/double-esc)
+
+    (assert/assert-is-hidden (util/get-by-text "Something went wrong" false))
+    (assert/assert-is-visible ".ls-view-body .ls-table-row")
+    (assert/assert-is-visible
+     (loc/filter ".ls-view-body .ls-table-row" :has-text zero-name))
+    (assert/assert-have-count
+     (loc/filter ".ls-view-body .ls-table-row" :has-text five-name)
+     0)
+
+    (w/refresh)
+    (w/wait-for (loc/filter ".ls-view-body .ls-table-row" :has-text zero-name)
+                {:timeout 15000})
+    (assert/assert-have-count
+     (loc/filter ".ls-view-body .ls-table-row" :has-text five-name)
+     0)))
