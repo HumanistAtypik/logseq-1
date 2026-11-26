@@ -5,6 +5,7 @@
             [datascript.core :as d]
             [datascript.impl.entity :as de]
             [logseq.db :as ldb]
+            [logseq.db.frontend.content :as db-content]
             [logseq.db.frontend.property :as db-property]))
 
 (defn stress-uuid-presence
@@ -184,6 +185,8 @@
           raw-title (or (:block/raw-title entity)
                         (:block/title entity)
                         (:block/name entity))
+          display-title (when (db-content/title-has-id-ref? raw-title)
+                          (db-content/recur-replace-uuid-in-block-title entity))
           list-type (order-list-type entity)
           datoms (cond->> (d/datoms db :eavt (:db/id entity))
                    true
@@ -213,7 +216,7 @@
         (assoc :block.temp/property-keys own-property-keys)
 
         raw-title
-        (assoc :block/title raw-title
+        (assoc :block/title (or display-title raw-title)
                :block/raw-title raw-title)
 
         (and include-derived? list-type)
@@ -263,7 +266,7 @@
       (assoc :logseq.property/query-id (ref-db-id (:logseq.property/query m)))
 
       (contains? m :logseq.property/view-for)
-      (assoc :logseq.property/view-for-id (ref-db-id (:logseq.property/view-for m)))
+      (assoc :logseq.property.view-for-id (ref-db-id (:logseq.property/view-for m)))
 
       (contains? m :logseq.property.view/type)
       (assoc :logseq.property.view/type-id (ref-db-id (:logseq.property.view/type m))
