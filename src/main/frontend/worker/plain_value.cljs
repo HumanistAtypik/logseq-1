@@ -266,7 +266,7 @@
       (assoc :logseq.property/query-id (ref-db-id (:logseq.property/query m)))
 
       (contains? m :logseq.property/view-for)
-      (assoc :logseq.property.view-for-id (ref-db-id (:logseq.property/view-for m)))
+      (assoc :logseq.property/view-for-id (ref-db-id (:logseq.property/view-for m)))
 
       (contains? m :logseq.property.view/type)
       (assoc :logseq.property.view/type-id (ref-db-id (:logseq.property.view/type m))
