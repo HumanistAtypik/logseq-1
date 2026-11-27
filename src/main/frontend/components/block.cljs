@@ -3561,8 +3561,8 @@
         format :markdown
         collapsed? (:collapsed? config)
         edit-block block
-        content (or (:block/raw-title block)
-                    (:block/title block))
+        content (or (:block/title block)
+                    (:block/raw-title block))
         content (if (string? content) (string/trim content) "")
         block-ref? (:block-ref? config)
         block (merge block (block/parse-title-and-body uuid format content))
