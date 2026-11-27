@@ -131,7 +131,7 @@ jobs:
 
       - name: Build/Release Electron App
         working-directory: ./static
-        run: pnpm install --frozen-lockfile && pnpm electron:make
+        run: pnpm install --frozen-lockfile --ignore-workspace && pnpm electron:make
 
       - name: Verify packaged embedding sidecar
         run: test -f static/dist/linux-unpacked/resources/sidecar/embedding_server.py
