@@ -83,9 +83,22 @@ jobs:
       - name: Fetch CLI pnpm deps
         run: pnpm --dir cli install --frozen-lockfile --ignore-workspace
 
+      - name: Compute app versions
+        id: ver
+        run: |
+          base=$(node ./scripts/get-pkg-version.js beta)
+          if ! printf '%s' "$base" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error title=VersionFail::unexpected version '$base'"
+            exit 1
+          fi
+          d=$(date -u +%Y%m%d)
+          echo "base=$base" >> $GITHUB_OUTPUT
+          echo "display=${base}_Version_personnalisée_${d}" >> $GITHUB_OUTPUT
+          echo "semver=${base}-Version-personnalisee.${d}" >> $GITHUB_OUTPUT
+          echo "computed display=${base}_Version_personnalisée_${d} semver=${base}-Version-personnalisee.${d}"
       - name: Stamp app version (Version personnalisée)
         run: |
-          sed -i 's/defonce version ".*"/defonce version "2.0.3_Version_personnalisée_2"/' src/main/frontend/version.cljs
+          sed -i 's/defonce version ".*"/defonce version "${{ steps.ver.outputs.display }}"/' src/main/frontend/version.cljs
           grep -n "defonce version" src/main/frontend/version.cljs
 
       - name: Set build environment variables
@@ -123,11 +136,11 @@ jobs:
       - name: Stamp package version (semver)
         working-directory: ./static
         run: |
-          sed -i "s/\"version\": \"0.0.1\"/\"version\": \"2.0.3-Version-personnalisee.2\"/" ./package.json
-          sed -i "s/\"version\": \"2.0.3\"/\"version\": \"2.0.3-Version-personnalisee.2\"/" ./package.json
+          sed -i "s/\"version\": \"0.0.1\"/\"version\": \"${{ steps.ver.outputs.semver }}\"/" ./package.json
+          sed -i "s/\"version\": \"${{ steps.ver.outputs.base }}\"/\"version\": \"${{ steps.ver.outputs.semver }}\"/" ./package.json
           grep "\"version\"" ./package.json
-          test "$(node -p "require(\"./package.json\").version")" = "2.0.3-Version-personnalisee.2"
-          echo "2.0.3_Version_personnalisée_2" > ./VERSION
+          test "$(node -p "require(\"./package.json\").version")" = "${{ steps.ver.outputs.semver }}"
+          echo "${{ steps.ver.outputs.display }}" > ./VERSION
 
       - name: Build/Release Electron App
         working-directory: ./static
@@ -163,6 +176,6 @@ jobs:
           body: |
             Logseq corrigé : le bogue des liens de pages imbriqués affichés en matricules (db-test#1557) est corrigé dans ce bâtiment.
             AppImage linux x64, bâtie du maître de ce dépôt : l'amont officiel du jour plus la permutation F1, rien d'autre.
-            Version affichée dans l'app : 2.0.3_Version_personnalisée_2.
+            Version affichée dans l'app : ${{ steps.ver.outputs.display }}.
           files: |
             ./builds/*
