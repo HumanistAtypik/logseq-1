@@ -149,6 +149,14 @@ jobs:
           cp -a deps/graph-lifecycle /home/runner/pkgstage/deps/graph-lifecycle
           cp -a sidecar /home/runner/pkgstage/sidecar
 
+      - name: Point the update channel to this fork
+        run: |
+          sed -i 's/owner: logseq/owner: HumanistAtypik/' /home/runner/pkgstage/static/electron-builder.yml
+          sed -i 's/repo: logseq/repo: logseq-1/' /home/runner/pkgstage/static/electron-builder.yml
+          grep -A3 '^publish:' /home/runner/pkgstage/static/electron-builder.yml
+          test "$(grep -c 'owner: HumanistAtypik' /home/runner/pkgstage/static/electron-builder.yml)" = "1"
+          test "$(grep -c 'repo: logseq-1' /home/runner/pkgstage/static/electron-builder.yml)" = "1"
+
       - name: Build/Release Electron App
         working-directory: /home/runner/pkgstage/static
         run: pnpm install --frozen-lockfile && pnpm electron:make
