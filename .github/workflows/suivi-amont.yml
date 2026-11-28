@@ -1,0 +1,90 @@
+# Suivi de l'amont logseq/logseq : chaque matin, fusionne les nouveaux commitis
+# du maître amont dans le maître de ce fork, sans aucun jeton personnel.
+# - les fichiers de flux du fork (.github/workflows) sont préservés tels quels :
+#   le jeton natif d'Actions refuse de pousser tout changement de flux ;
+# - au moindre conflit ailleurs (notamment le correctif F1), échec fort :
+#   rien n'est poussé, le maître reste intact, GitHub notifie par courriel ;
+# - après la poussée, le bâtiment AppImage est déclenché explicitement :
+#   une poussée au jeton natif ne déclenche jamais de nouvelle exécution.
+name: Suivi-Amont
+
+on:
+  schedule:
+    - cron: '41 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: suivi-amont
+  cancel-in-progress: false
+
+jobs:
+  merge-upstream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out master (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: master
+
+      - name: Fetch upstream master
+        run: |
+          git remote add upstream https://github.com/logseq/logseq.git
+          git fetch upstream master
+          echo "upstream master is now at $(git rev-parse --short upstream/master)"
+
+      - name: Check whether upstream has anything new
+        id: check
+        run: |
+          if [ "$(git rev-parse upstream/master)" = "$(git merge-base HEAD upstream/master)" ]; then
+            echo "up_to_date=true" >> $GITHUB_OUTPUT
+            echo "already up to date with upstream $(git rev-parse --short upstream/master)"
+          else
+            echo "up_to_date=false" >> $GITHUB_OUTPUT
+            echo "upstream has new commits to merge"
+          fi
+
+      - name: Merge upstream, keeping this fork's workflows
+        id: merge
+        if: steps.check.outputs.up_to_date == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-commit --no-ff upstream/master
+          git checkout HEAD -- .github/workflows/
+          added=$(git diff --name-only --diff-filter=A HEAD -- .github/workflows/)
+          if [ -n "$added" ]; then
+            printf '%s\n' "$added" | xargs -r git rm -f --quiet
+          fi
+          if git diff --quiet HEAD; then
+            git merge --abort
+            echo "merged=false" >> $GITHUB_OUTPUT
+            echo "upstream changed only workflow files; nothing to apply"
+          else
+            git commit --no-edit -m "Merge upstream master $(git rev-parse --short upstream/master) (keep fork workflows)"
+            echo "merged=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Refuse to push if any workflow file changed
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          changed=$(git diff --name-only origin/master HEAD -- .github/workflows/)
+          if [ -n "$changed" ]; then
+            echo "::error title=WorkflowChange::refusing to push, workflow files changed: $changed"
+            exit 1
+          fi
+
+      - name: Push merged master
+        if: steps.merge.outputs.merged == 'true'
+        run: git push origin master
+
+      - name: Trigger the AppImage build
+        if: steps.merge.outputs.merged == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run build-appimage.yml --ref master
