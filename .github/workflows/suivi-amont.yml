@@ -61,13 +61,10 @@ jobs:
           if [ -n "$added" ]; then
             printf '%s\n' "$added" | xargs -r git rm -f --quiet
           fi
-          if git diff --quiet HEAD; then
-            git merge --abort
-            echo "merged=false" >> $GITHUB_OUTPUT
-            echo "upstream changed only workflow files; nothing to apply"
-          else
-            git commit --no-edit -m "Merge upstream master $(git rev-parse --short upstream/master) (keep fork workflows)"
-            echo "merged=true" >> $GITHUB_OUTPUT
+          git commit --no-edit -m "Merge upstream master $(git rev-parse --short upstream/master) (keep fork workflows)"
+          echo "merged=true" >> $GITHUB_OUTPUT
+          if git diff --quiet HEAD^ HEAD; then
+            echo "merge commit records ancestry; content already carried"
           fi
 
       - name: Refuse to push if any workflow file changed
